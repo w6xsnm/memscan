@@ -1,4 +1,5 @@
 #include <ntifs.h>
+#include <utility>
 
 //undocumented windows internal functions (exported by ntoskrnl)
 extern "C" {
@@ -9,6 +10,17 @@ extern "C" {
 											 SIZE_T BufferSize, KPROCESSOR_MODE PreviousMode,
 											 PSIZE_T ReturnSize);
 }
+
+// IOC (Indicators of Compromise) buffer constants
+#define IOC_MAX_ENTRIES    512
+#define IOC_MESSAGE_SIZE   128
+
+// IOCTL control codes
+#define IOCTL_ATTACH_PROCESS   CTL_CODE(FILE_DEVICE_UNKNOWN, 0x696, METHOD_BUFFERED, FILE_SPECIAL_ACCESS)
+#define IOCTL_READ_MEMORY      CTL_CODE(FILE_DEVICE_UNKNOWN, 0x697, METHOD_BUFFERED, FILE_SPECIAL_ACCESS)
+#define IOCTL_WRITE_MEMORY     CTL_CODE(FILE_DEVICE_UNKNOWN, 0x698, METHOD_BUFFERED, FILE_SPECIAL_ACCESS)
+#define IOCTL_GET_IOC_BUFFER   CTL_CODE(FILE_DEVICE_UNKNOWN, 0x699, METHOD_BUFFERED, FILE_READ_DATA)
+#define IOCTL_CLEAR_IOC_BUFFER CTL_CODE(FILE_DEVICE_UNKNOWN, 0x69A, METHOD_BUFFERED, FILE_WRITE_DATA)
 
 /**
  * @brief Print debug message from km
@@ -25,19 +37,23 @@ void DebugPrint(PCSTR text) {
 namespace driver {
 	namespace codes {
 		// Setup the driver
-		constexpr ULONG attach = 
-			CTL_CODE(FILE_DEVICE_UNKNOWN, 0x696, METHOD_BUFFERED, FILE_SPECIAL_ACCESS);
+		constexpr ULONG attach = IOCTL_ATTACH_PROCESS;
 
 		// Read process memory
-		constexpr ULONG read =
-			CTL_CODE(FILE_DEVICE_UNKNOWN, 0x697, METHOD_BUFFERED, FILE_SPECIAL_ACCESS);
-		
+		constexpr ULONG read = IOCTL_READ_MEMORY;
+
 		// Write process memory
-		constexpr ULONG write =
-			CTL_CODE(FILE_DEVICE_UNKNOWN, 0x698, METHOD_BUFFERED, FILE_SPECIAL_ACCESS);
+		constexpr ULONG write = IOCTL_WRITE_MEMORY;
+
+		// Copy ioc to um
+		constexpr ULONG get_ioc = IOCTL_GET_IOC_BUFFER;
+
+		// Clear ioc buffer and counter 
+		constexpr ULONG clear_ioc = IOCTL_CLEAR_IOC_BUFFER;
+
 	} //namespace codes
 
-	// Shared between um & km
+	// Shared between um & km for IOCTL
 	struct Request {
 		HANDLE ProcessId;
 
@@ -47,6 +63,12 @@ namespace driver {
 		SIZE_T BufferSize;
 		SIZE_T ReturnSize;
 	};
+
+	// IOC log buffer
+	static CHAR IocBuffer[IOC_MAX_ENTRIES][IOC_MESSAGE_SIZE];
+	static ULONG IocCount = 0;
+
+	VOID ScanProcess(PEPROCESS Process);
 
 	//IRP major functions
 
@@ -60,6 +82,12 @@ namespace driver {
 		return irp->IoStatus.Status;
 	}*/
 
+	/**
+	 * @brief Handle create calls
+	 * @param DeviceObject Never used
+	 * @param irp Request
+	 * @return 
+	 */
 	NTSTATUS create(PDEVICE_OBJECT DeviceObject, PIRP irp) {
 		UNREFERENCED_PARAMETER(DeviceObject);
 
@@ -68,6 +96,12 @@ namespace driver {
 		return irp->IoStatus.Status;
 	}
 
+	/**
+	 * @brief Handle close calls
+	 * @param DeviceObject Never used
+	 * @param irp Request
+	 * @return 
+	 */
 	NTSTATUS close(PDEVICE_OBJECT DeviceObject, PIRP irp) {
 		UNREFERENCED_PARAMETER(DeviceObject);
 
@@ -76,14 +110,18 @@ namespace driver {
 		return irp->IoStatus.Status;
 	}
 
-	//TODO
+	/**
+	 * @brief Handle DeviceIoControl requests
+	 * @param DeviceObject Never used
+	 * @param irp Request
+	 * @return 
+	 */
 	NTSTATUS device_control(PDEVICE_OBJECT DeviceObject, PIRP irp) {
 		UNREFERENCED_PARAMETER(DeviceObject);
 
 		DebugPrint("[+] Device control called.\n");
 
 		NTSTATUS status = STATUS_UNSUCCESSFUL;
-
 
 		// used to determine ctl code
 		PIO_STACK_LOCATION stack_irp = IoGetCurrentIrpStackLocation(irp);
@@ -93,6 +131,8 @@ namespace driver {
 
 		if (stack_irp == nullptr or request == nullptr) {
 			IoCompleteRequest(irp, IO_NO_INCREMENT);
+
+			DebugPrint("[-] Failed to get stack irp or request.\n");
 			return status;
 		}
 
@@ -118,6 +158,26 @@ namespace driver {
 					status = MmCopyVirtualMemory(PsGetCurrentProcess(), request->pBuffer,
 												 TargetProcess, request->pTarget, request->BufferSize, 
 												 KernelMode, &request->ReturnSize);
+				}
+				break;
+
+			case codes::get_ioc:
+				{
+					ULONG toCopy = min(IocCount * IOC_MESSAGE_SIZE,
+									   stack_irp->Parameters.DeviceIoControl.OutputBufferLength);
+					RtlCopyMemory(irp->AssociatedIrp.SystemBuffer, IocBuffer, toCopy);
+
+					status = STATUS_SUCCESS;
+					irp->IoStatus.Information = toCopy;
+				}
+				break;
+
+			case codes::clear_ioc: 
+				{
+					IocCount = 0;
+					RtlZeroMemory(IocBuffer, sizeof(IocBuffer));
+
+					status = STATUS_SUCCESS;
 				}
 				break;
 
