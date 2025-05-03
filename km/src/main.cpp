@@ -1,5 +1,4 @@
 #include <ntifs.h>
-#include <utility>
 
 //undocumented windows internal functions (exported by ntoskrnl)
 extern "C" {
@@ -22,6 +21,12 @@ extern "C" {
 #define IOCTL_GET_IOC_BUFFER   CTL_CODE(FILE_DEVICE_UNKNOWN, 0x699, METHOD_BUFFERED, FILE_READ_DATA)
 #define IOCTL_CLEAR_IOC_BUFFER CTL_CODE(FILE_DEVICE_UNKNOWN, 0x69A, METHOD_BUFFERED, FILE_WRITE_DATA)
 
+// Global device, driver and symbolic link names
+static PDEVICE_OBJECT gDeviceObject = nullptr;
+static UNICODE_STRING gDeviceName = RTL_CONSTANT_STRING(L"\\Device\\MemscanDriver");
+static UNICODE_STRING gDriverName = RTL_CONSTANT_STRING(L"\\Driver\\MemscanDriver");
+static UNICODE_STRING gSymLinkName = RTL_CONSTANT_STRING(L"\\DosDevices\\MemscanDriver");
+
 /**
  * @brief Print debug message from km
  * @param text Debug message
@@ -36,20 +41,11 @@ void DebugPrint(PCSTR text) {
 
 namespace driver {
 	namespace codes {
-		// Setup the driver
-		constexpr ULONG attach = IOCTL_ATTACH_PROCESS;
-
-		// Read process memory
-		constexpr ULONG read = IOCTL_READ_MEMORY;
-
-		// Write process memory
-		constexpr ULONG write = IOCTL_WRITE_MEMORY;
-
-		// Copy ioc to um
-		constexpr ULONG get_ioc = IOCTL_GET_IOC_BUFFER;
-
-		// Clear ioc buffer and counter 
-		constexpr ULONG clear_ioc = IOCTL_CLEAR_IOC_BUFFER;
+		constexpr ULONG attach = IOCTL_ATTACH_PROCESS;		// Setup the driver
+		constexpr ULONG read = IOCTL_READ_MEMORY;			// Read process memory
+		constexpr ULONG write = IOCTL_WRITE_MEMORY;			// Write process memory
+		constexpr ULONG get_ioc = IOCTL_GET_IOC_BUFFER;		// Copy ioc to um
+		constexpr ULONG clear_ioc = IOCTL_CLEAR_IOC_BUFFER;	// Clear ioc buffer and counter 
 
 	} //namespace codes
 
@@ -68,7 +64,13 @@ namespace driver {
 	static CHAR IocBuffer[IOC_MAX_ENTRIES][IOC_MESSAGE_SIZE];
 	static ULONG IocCount = 0;
 
-	VOID ScanProcess(PEPROCESS Process);
+	// Last attached process for read/write
+	static PEPROCESS TargetProcess = nullptr;
+
+	// Forward declarations for notifications
+	//VOID ScanProcess(PEPROCESS Process);
+	//VOID OnProcessNotify(PEPROCESS Process, HANDLE ProcessId, PPS_CREATE_NOTIFY_INFO CreateInfo);
+	//VOID OnImageLoadNotify(PUNICODE_STRING FullImageName, HANDLE ProcessId, PIMAGE_INFO ImageInfo);
 
 	//IRP major functions
 
@@ -136,9 +138,6 @@ namespace driver {
 			return status;
 		}
 
-		// process we want access to (rw)
-		static PEPROCESS TargetProcess = nullptr;
-
 		const ULONG control_code = stack_irp->Parameters.DeviceIoControl.IoControlCode;
 		switch (control_code) {
 			case codes::attach:
@@ -146,7 +145,7 @@ namespace driver {
 				break;
 
 			case codes::read:
-				if (TargetProcess != nullptr) {
+				if (TargetProcess) {
 					status = MmCopyVirtualMemory(TargetProcess, request->pTarget,
 												 PsGetCurrentProcess(), request->pBuffer,
 												 request->BufferSize, KernelMode, &request->ReturnSize);
@@ -154,7 +153,7 @@ namespace driver {
 				break;
 
 			case codes::write:
-				if (TargetProcess != nullptr) {
+				if (TargetProcess) {
 					status = MmCopyVirtualMemory(PsGetCurrentProcess(), request->pBuffer,
 												 TargetProcess, request->pTarget, request->BufferSize, 
 												 KernelMode, &request->ReturnSize);
@@ -167,8 +166,7 @@ namespace driver {
 									   stack_irp->Parameters.DeviceIoControl.OutputBufferLength);
 					RtlCopyMemory(irp->AssociatedIrp.SystemBuffer, IocBuffer, toCopy);
 
-					status = STATUS_SUCCESS;
-					irp->IoStatus.Information = toCopy;
+					status = irp->IoStatus.Status;
 				}
 				break;
 
@@ -177,11 +175,12 @@ namespace driver {
 					IocCount = 0;
 					RtlZeroMemory(IocBuffer, sizeof(IocBuffer));
 
-					status = STATUS_SUCCESS;
+					status = irp->IoStatus.Status;
 				}
 				break;
 
 			default:
+				status = STATUS_INVALID_DEVICE_REQUEST;
 				break;
 		}
 
@@ -195,6 +194,15 @@ namespace driver {
 
 } // namespace driver
 
+VOID DriverUnload(PDRIVER_OBJECT DriverObject) {
+	UNREFERENCED_PARAMETER(DriverObject);
+
+	//PsSetCreateProcessNotifyRoutineEx(driver::OnProcessNotify, TRUE);
+	//PsRemoveLoadImageNotifyRoutine(driver::OnImageLoadNotify);
+	IoDeleteSymbolicLink(&gSymLinkName);
+	IoDeleteDevice(gDeviceObject);
+}
+
 /**
  * @brief Initialize driver
  * @param DriverObject Driver object
@@ -204,39 +212,36 @@ namespace driver {
 NTSTATUS DriverMain(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) {
 	UNREFERENCED_PARAMETER(RegistryPath);
 
-	//create device
-	UNICODE_STRING device_name = {};
-	RtlInitUnicodeString(&device_name, L"\\Device\\MemscanDriver");
-
-	PDEVICE_OBJECT DeviceObject;
-	NTSTATUS status = IoCreateDevice(DriverObject, 0, &device_name, FILE_DEVICE_UNKNOWN,
-									 FILE_DEVICE_SECURE_OPEN, FALSE, &DeviceObject);
+	// Create device
+	NTSTATUS status = IoCreateDevice(DriverObject, 0, &gDeviceName, FILE_DEVICE_UNKNOWN,
+									 FILE_DEVICE_SECURE_OPEN, FALSE, &gDeviceObject);
 
 	if (status != STATUS_SUCCESS) {
 		DebugPrint("[-] Failed to create driver device.\n");
 	}
 	DebugPrint("[+] Driver device successfully created.\n");
 
-	// establish symbolic link
-	UNICODE_STRING symbolic_link = {};
-	RtlInitUnicodeString(&symbolic_link, L"\\DosDevices\\MemscanDriver");
-
-	status = IoCreateSymbolicLink(&symbolic_link, &device_name);
+	// Establish symbolic link
+	status = IoCreateSymbolicLink(&gSymLinkName, &gDeviceName);
 	if (status != STATUS_SUCCESS) {
 		DebugPrint("[-] Failed to establish symbolic link.\n");
 	}
 	DebugPrint("[+] Symbolic link was established successfully.\n");
 
-	// allow to send small data between um&km
-	SetFlag(DeviceObject->Flags, DO_BUFFERED_IO);
+	// Allow to send small data between um&km
+	SetFlag(gDeviceObject->Flags, DO_BUFFERED_IO);
 
-	// set the driver handlers to our functions with our logic
+	// Set IRP handlers
 	DriverObject->MajorFunction[IRP_MJ_CREATE] = driver::create;
 	DriverObject->MajorFunction[IRP_MJ_CLOSE] = driver::close;
 	DriverObject->MajorFunction[IRP_MJ_DEVICE_CONTROL] = driver::device_control;
 
-	// end of initialization
-	ClearFlag(DeviceObject->Flags, DO_DEVICE_INITIALIZING);
+	// Register notifications
+	//PsSetCreateProcessNotifyRoutineEx(driver::OnProcessNotify, FALSE);
+	//PsSetLoadImageNotifyRoutine(driver::OnImageLoadNotify);
+
+	// End of initialization
+	ClearFlag(gDeviceObject->Flags, DO_DEVICE_INITIALIZING);
 
 	DebugPrint("[+] Driver initialized successfully.\n");
 
@@ -250,8 +255,5 @@ NTSTATUS DriverMain(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) {
 NTSTATUS DriverEntry() {
 	DebugPrint("[+] Message from the driver!\n");
 
-	UNICODE_STRING driver_name = {};
-	RtlInitUnicodeString(&driver_name, L"\\Driver\\MemscanDriver");
-
-	return IoCreateDriver(&driver_name, &DriverMain);
+	return IoCreateDriver(&gDriverName, &DriverMain);
 }
