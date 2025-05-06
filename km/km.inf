@@ -8,7 +8,7 @@ Class       = System ; TODO: specify appropriate Class
 ClassGuid   = {4d36e97d-e325-11ce-bfc1-08002be10318} ; TODO: specify appropriate ClassGuid
 Provider    = %ManufacturerName%
 CatalogFile = km.cat
-DriverVer   = ; TODO: set DriverVer in stampinf property pages
+DriverVer   = 1.0.0.0
 PnpLockdown = 1
 
 [DestinationDirs]
@@ -56,7 +56,7 @@ KmdfLibraryVersion = $KMDFVERSION$
 
 [Strings]
 SPSVCINST_ASSOCSERVICE = 0x00000002
-ManufacturerName = "<Your manufacturer name>" ;TODO: Replace with your manufacturer name
-DiskName = "km Installation Disk"
-km.DeviceDesc = "km Device"
-km.SVCDESC = "km Service"
+ManufacturerName = "kklimeshov" ;TODO: Replace with your manufacturer name
+DiskName = "Memscan Installation Disk"
+km.DeviceDesc = "Memscan Device"
+km.SVCDESC = "Memscan Service"
