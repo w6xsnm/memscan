@@ -569,8 +569,7 @@ BOOLEAN driver::IsSystemProcess(PEPROCESS Process) {
 		return TRUE;
 
 	PUNICODE_STRING imgName = nullptr;
-	NTSTATUS status = SeLocateProcessImageName(Process, &imgName);
-	if (!NT_SUCCESS(status) || !imgName) {
+	if (!NT_SUCCESS(SeLocateProcessImageName(Process, &imgName)) || !imgName) {
 		return FALSE;
 	}
 
@@ -602,8 +601,7 @@ VOID driver::CheckMrdataAddresses(PEPROCESS Process) {
 
 	// 0. Get process name for debug only
 	PUNICODE_STRING processName = nullptr;
-	NTSTATUS nameStatus = SeLocateProcessImageName(Process, &processName);
-	if (NT_SUCCESS(nameStatus) && processName) {
+	if (NT_SUCCESS(SeLocateProcessImageName(Process, &processName)) && processName) {
 		DebugPrint("[+] Scanning process: %wZ\n", processName);
 		ExFreePool(processName);
 	}
@@ -614,32 +612,28 @@ VOID driver::CheckMrdataAddresses(PEPROCESS Process) {
 
 	// 1. Get process PEB
 	PPEB peb = nullptr;
-	NTSTATUS status = GetProcessPeb(Process, &peb);
-	if (!NT_SUCCESS(status)) {
+	if (!NT_SUCCESS(GetProcessPeb(Process, &peb))) {
 		DebugPrint("[-] CheckMrdataAddresses: Failed to get PEB.\n");
 		return;
 	}
 
 	// 2. Get ntdll.dll base address
 	PVOID ntdllBase = nullptr;
-	status = GetModuleBaseByName(peb, L"ntdll.dll", &ntdllBase);
-	if (!NT_SUCCESS(status)) {
+	if (!NT_SUCCESS(GetModuleBaseByName(peb, L"ntdll.dll", &ntdllBase))) {
 		DebugPrint("[-] CheckMrdataAddresses: Failed to find ntdll.dll.\n");
 		return;
 	}
 
 	// 3. Get DOS header
 	IMAGE_DOS_HEADER dosHeader = { 0 };
-	status = GetDosHeader(Process, ntdllBase, &dosHeader);
-	if (!NT_SUCCESS(status)) {
+	if (!NT_SUCCESS(GetDosHeader(Process, ntdllBase, &dosHeader))) {
 		DebugPrint("[-] CheckMrdataAddresses: Invalid ntdll.dll DOS header.\n");
 		return;
 	}
 
 	// 4. Get NT headers
 	IMAGE_NT_HEADERS64 ntHeaders = { 0 };
-	status = GetNtHeaders(Process, ntdllBase, &dosHeader, &ntHeaders);
-	if (!NT_SUCCESS(status)) {
+	if (!NT_SUCCESS(GetNtHeaders(Process, ntdllBase, &dosHeader, &ntHeaders))) {
 		DebugPrint("[-] CheckMrdataAddresses: Invalid ntdll.dll NT headers.\n");
 		return;
 	}
@@ -653,71 +647,100 @@ VOID driver::CheckMrdataAddresses(PEPROCESS Process) {
 
 	// 6. Scan for EDR preloading and Early Cascade patterns in .mrdata
 
-	SIZE_T step = sizeof(PVOID);
+	EdrIndicators indicators = {};
 
 	// EDR Preloading indicators
 
-	for (SIZE_T i = 0; i < mrdata.Size / step; ++i) {
-		PVOID candidate = nullptr;
-		SIZE_T bytesRead = 0;
-
-		NTSTATUS status1 = MmCopyVirtualMemory(Process, (PBYTE)mrdata.Base + i * step,
-												  PsGetCurrentProcess(), &candidate,
-												  step, KernelMode, &bytesRead);
-
-		if (!NT_SUCCESS(status1) || bytesRead != step) {
-			DebugPrint("[-] MmCopyVirtualMemory failed at 0x%p (Status: 0x%X, Bytes: %zu)\n", (PBYTE)mrdata.Base + i * step, status1, bytesRead);
-			continue;
-		}
-
-		if (candidate == mrdata.Base) {
-			DebugPrint("[+] Found self-reference at offset 0x%X (Value: 0x%p)\n", i * step, candidate);
-
-			PBYTE pmr = (PBYTE)mrdata.Base + i * step; // self-reference variable on mrdata is perfect indicator
-
-			// AvrfpEnabled/AvrfpRoutine
-			for (SIZE_T j = 1; j < 3; ++j) {
-				PVOID val = nullptr;
-				NTSTATUS status2 = MmCopyVirtualMemory(Process, pmr + j * step, PsGetCurrentProcess(),
-													   &val, step, KernelMode, &bytesRead);
-				if (NT_SUCCESS(status2)) {
-					DebugPrint("    [%zu] Candidate at 0x%p: 0x%p\n", j, pmr + j * step, val);
-
-					if (val == nullptr) {
-						driver::gAvrfpEnabled = pmr + (j - 1) * step;
-						driver::gAvrfpRoutine = pmr + j * step;
-						DebugPrint("[+] Found EDR pointers:\n"
-							"    AvrfpEnabled: 0x%p\n"
-							"    AvrfpRoutine: 0x%p\n",
-							driver::gAvrfpEnabled,
-							driver::gAvrfpRoutine);
-					}
-				}
+	// 6.1. Finding an anchor. An anchor - variable in .mrdata, which offsets are useful to find rootkit patterns
+	PBYTE pmr = NULL;
+	for (SIZE_T offset = 0; offset < mrdata.Size; offset += sizeof(PVOID)) {
+		PVOID value = NULL;
+		if (NT_SUCCESS(MmCopyVirtualMemory(Process, (PBYTE)mrdata.Base + offset,
+			PsGetCurrentProcess(), &value,
+			sizeof(PVOID), KernelMode, NULL))) {
+			if (value == mrdata.Base) { // anchor is always equal to mrdata base
+				pmr = (PBYTE)mrdata.Base + offset;
+				DebugPrint("[+] Anchor found @ 0x%p (offset +0x%zX)\n", pmr, offset);
+				break;
 			}
 		}
 	}
 
-	// Early Cascade Injection 
+	if (!pmr) {
+		DebugPrint("[-] Anchor not found in .mrdata.\n");
+		return;
+	}
 
-	PBYTE searchStart = (PBYTE)driver::gAvrfpEnabled - 0x100; // offset based on heuristics, does not important
+	// 6.2. Finding AvrfpEnabled/AvrfpRoutine
 
-	for (int i = 0; i < 100; i++) { // heuristic based index just not to enter endless cycle
-		PBYTE candidate = searchStart - (i * sizeof(PVOID));
-		PVOID value = nullptr;
-		SIZE_T bytesRead = 0;
+	for (int i = 1; i <= 10; i++) { // heuristic based index just not to enter endless cycle
+		PBYTE candidate = pmr + (i * sizeof(PVOID));
+		PVOID enabled = NULL;
+		PVOID routine = NULL;
 
-		NTSTATUS status3 = MmCopyVirtualMemory(Process, candidate,
-											   PsGetCurrentProcess(), &value,
-											   sizeof(PVOID), KernelMode, &bytesRead);
-		if (NT_SUCCESS(status3)) {
-			DebugPrint("[+] Found gpfnSE_DllLoaded candidate @ 0x%p (Value: 0x%p)", candidate, value);
-			// Check if that looks like function offset
-			if ((ULONG_PTR)value > (ULONG_PTR)ntdllBase &&
-				(ULONG_PTR)value < ((ULONG_PTR)ntdllBase + 0x200000)) {
-				driver::gpfnSE_DllLoaded = candidate;
-				DebugPrint("[+] Found gpfnSE_DllLoaded that looks like function @ 0x%p (Value: 0x%p)", candidate, value);
+		if (!NT_SUCCESS(MmCopyVirtualMemory(Process, candidate, PsGetCurrentProcess(), &enabled,
+			sizeof(PVOID), KernelMode, NULL))) {
+			continue;
+		}
+
+		if (!NT_SUCCESS(MmCopyVirtualMemory(Process, candidate + sizeof(PVOID),
+			PsGetCurrentProcess(), &routine,
+			sizeof(PVOID), KernelMode, NULL))) {
+			continue;
+		}
+
+		DebugPrint("[+] Candidate Avrfp pointers found (+%d steps):\n"
+			"    Enabled @ 0x%p (0x%p)\n"
+			"    Routine @ 0x%p (0x%p)\n",
+			i, candidate, enabled, candidate + sizeof(PVOID), routine);
+
+		// pAvrfpEnabled in clean process is the first NULL variable after anchor
+		// pAvrfpRoutine = pAvrfpEnabled + sizeof(PVOID) and in clean process it is equal to NULL
+
+		// In malware process, however, both these variables are not equal to NULL
+		// In malware process AvrfpEnabled is equal to 1
+		// And AvrfpRoutine is equal to shellcode image base
+
+		// Clean process
+		if ((enabled == NULL || (UINT_PTR)enabled <= 1) && routine == NULL) {
+			indicators.AvrfpEnabled = candidate;
+			indicators.AvrfpRoutine = candidate + sizeof(PVOID);
+			DebugPrint("[+] Clean Avrfp pointers found (+%d steps):\n"
+				"    Enabled @ 0x%p (0x%p)\n"
+				"    Routine @ 0x%p (0x%p)\n",
+				i, candidate, enabled, candidate + sizeof(PVOID), routine);
+			break;
+		}
+		else if ((UINT_PTR)enabled == 1 && routine != NULL) { // malware process
+			indicators.AvrfpEnabled = candidate;
+			indicators.AvrfpRoutine = candidate + sizeof(PVOID);
+			// TODO: IOCs
+			DebugPrint("[+] Hooked Avrfp pointers found (+%d steps):\n"
+				"    Enabled @ 0x%p (0x%p)\n"
+				"    Routine @ 0x%p (0x%p)\n",
+				i, candidate, enabled, candidate + sizeof(PVOID), routine);
+			break;
+		}
+	}
+
+	// 6.3. Finding gpfnSE_DllLoaded
+
+	// heuristic based offsets for that variable
+	// All variables on that offsets should be equal to NULL in clean process
+	const SIZE_T possibleOffsets[] = { static_cast<SIZE_T>(-0x38), static_cast<SIZE_T>(-0x40), static_cast<SIZE_T>(-0x48), static_cast<SIZE_T>(-0x50) }; 
+
+	for (size_t i = 0; i < ARRAYSIZE(possibleOffsets); i++) {
+		PBYTE candidate = pmr + possibleOffsets[i];
+		PVOID value = NULL;
+
+		if (NT_SUCCESS(MmCopyVirtualMemory(Process, candidate,
+			PsGetCurrentProcess(), &value,
+			sizeof(PVOID), KernelMode, NULL))) {
+			// TODO: IOCs
+			indicators.gpfnSE_DllLoaded = candidate;
+			DebugPrint("[+] Found gpfnSE_DllLoaded candidate @ 0x%p (value: 0x%p)\n",
+				candidate, value);
 				break;
-			}
 		}
 	}
 
@@ -726,17 +749,17 @@ VOID driver::CheckMrdataAddresses(PEPROCESS Process) {
 		LogIoc("[EDR] AvrfpAPILookupCallbacksEnabled true");
 	}
 
-	// Проверка AvrfpRoutine (PVOID)
-	if (CheckPointerValue(Process, driver::gAvrfpRoutine, FALSE)) {
-		DebugPrint("[+] AvrfpAPILookupCallbackRoutine is hooked\n");
-		LogIoc("[EDR] AvrfpAPILookupCallbackRoutine hooked");
-	}
+	//// Проверка AvrfpRoutine (PVOID)
+	//if (CheckPointerValue(Process, driver::gAvrfpRoutine, FALSE)) {
+	//	DebugPrint("[+] AvrfpAPILookupCallbackRoutine is hooked\n");
+	//	LogIoc("[EDR] AvrfpAPILookupCallbackRoutine hooked");
+	//}
 
-	// Проверка gpfnSE_DllLoaded (PVOID)
-	if (CheckPointerValue(Process, driver::gpfnSE_DllLoaded, FALSE)) {
-		DebugPrint("[+] gpfnSE_DllLoaded is hooked\n");
-		LogIoc("[EDR] gpfnSE_DllLoaded hooked");
-	}
+	//// Проверка gpfnSE_DllLoaded (PVOID)
+	//if (CheckPointerValue(Process, driver::gpfnSE_DllLoaded, FALSE)) {
+	//	DebugPrint("[+] gpfnSE_DllLoaded is hooked\n");
+	//	LogIoc("[EDR] gpfnSE_DllLoaded hooked");
+	//}
 
 	DebugPrint("[+] EDR scan completed for process PID: %d\n", PsGetProcessId(Process));
 }

@@ -194,3 +194,9 @@ struct SectionInfo {
 	PVOID Base;
 	SIZE_T Size;
 };
+
+struct EdrIndicators {
+	PVOID AvrfpEnabled;
+	PVOID AvrfpRoutine;
+	PVOID gpfnSE_DllLoaded;
+};
