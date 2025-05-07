@@ -54,6 +54,7 @@ static const wchar_t* SystemProcessWhitelist[] = {
 	L"\\??\\*\\Windows\\System32\\wininit.exe",
 	L"\\??\\*\\Windows\\System32\\services.exe",
 	L"\\??\\*\\Windows\\System32\\lsass.exe",
+	L"\\??\\*\\Windows\\System32\\RuntimeBroker.exe",
 
 	// VMware processes
 	L"\\??\\*\\Program Files\\VMware\\VMware Tools\\vmtoolsd.exe",
