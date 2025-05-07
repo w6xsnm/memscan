@@ -9,27 +9,12 @@
  */
 void DebugPrint(PCSTR format, ...) {
 #ifndef DEBUG
-	UNREFERENCED_PARAMETER(format);
+    UNREFERENCED_PARAMETER(format);
 #endif
-	va_list args;
-	va_start(args, format);
-
-	// For simple string case (no format specifiers)
-	if (strchr(format, '%') == NULL) {
-		KdPrintEx((DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL, "%s", format));
-	}
-	else {
-		// For formatted output
-		vDbgPrintExWithPrefix(
-			"[DRIVER] ",  // Optional prefix
-			DPFLTR_IHVDRIVER_ID,
-			DPFLTR_INFO_LEVEL,
-			format,
-			args
-		);
-	}
-
-	va_end(args);
+    va_list args;
+    va_start(args, format);
+	vDbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL, format, args);
+    va_end(args);
 }
 
 /**
@@ -165,7 +150,7 @@ NTSTATUS GetNtHeaders(PEPROCESS Process, PVOID imageBase,
 		return STATUS_INVALID_IMAGE_FORMAT;
 	}
 
-	DebugPrint("[+] GetNtHeaders: Valid NT headers (Segnature: 0x%X, Sections: %d, ImageSize: 0x%X)\n",
+	DebugPrint("[+] GetNtHeaders: Valid NT headers (Signature: 0x%X, Sections: %d, ImageSize: 0x%X)\n",
 		ntHeaders->Signature,
 		ntHeaders->FileHeader.NumberOfSections,
 		ntHeaders->OptionalHeader.SizeOfImage);
@@ -178,28 +163,31 @@ NTSTATUS GetNtHeaders(PEPROCESS Process, PVOID imageBase,
  * @param name Section name (e.g. ".mrdata")
  * @return PVOID Section base address or NULL if not found
  */
-PVOID GetSectionBase(PVOID baseAddress, const char* name) {
-	PIMAGE_DOS_HEADER dosHeader = (PIMAGE_DOS_HEADER)baseAddress;
-	PIMAGE_NT_HEADERS64 ntHeaders = (PIMAGE_NT_HEADERS64)((ULONG_PTR)baseAddress + dosHeader->e_lfanew);
+SectionInfo GetSectionInfo(PVOID moduleBase, const char* sectionName) {
+	SectionInfo info = { nullptr, 0 };
+	PIMAGE_DOS_HEADER dosHeader = (PIMAGE_DOS_HEADER)moduleBase;
+	PIMAGE_NT_HEADERS64 ntHeaders = (PIMAGE_NT_HEADERS64)((ULONG_PTR)moduleBase + dosHeader->e_lfanew);
 
 	// Validate PE headers
 	if (dosHeader->e_magic != IMAGE_DOS_SIGNATURE) {
-		DebugPrint("[-] GetSectionBase: Invalid DOS signature (0x%X)\n", dosHeader->e_magic);
-		return nullptr;
+		DebugPrint("[-] GetSectionInfo: Invalid DOS signature (0x%X)\n", dosHeader->e_magic);
+		return info;
 	}
 
 	if (ntHeaders->Signature != IMAGE_NT_SIGNATURE) {
-		DebugPrint("[-] GetSectionBase: Invalid NT signature (0x%X)\n", ntHeaders->Signature);
-		return nullptr;
+		DebugPrint("[-] GetSectionInfo: Invalid NT signature (0x%X)\n", ntHeaders->Signature);
+		return info;
 	}
 
-	// Calculate section headers pointer
-	PIMAGE_SECTION_HEADER sections = (PIMAGE_SECTION_HEADER)(
-									 (ULONG_PTR)ntHeaders +
-						             sizeof(IMAGE_NT_HEADERS64) -
-									 sizeof(IMAGE_OPTIONAL_HEADER64) + ntHeaders->FileHeader.SizeOfOptionalHeader);
+	//// Calculate section headers pointer
+	//PIMAGE_SECTION_HEADER sections = (PIMAGE_SECTION_HEADER)(
+	//								 (ULONG_PTR)ntHeaders +
+	//					             sizeof(IMAGE_NT_HEADERS64) -
+	//								 sizeof(IMAGE_OPTIONAL_HEADER64) + ntHeaders->FileHeader.SizeOfOptionalHeader);
 
-	DebugPrint("[+] GetSectionBase: Scanning %d sections in module 0x%p\n", ntHeaders->FileHeader.NumberOfSections, baseAddress);
+	PIMAGE_SECTION_HEADER sections = IMAGE_FIRST_SECTION(ntHeaders);
+
+	DebugPrint("[+] GetSectionInfo: Scanning %d sections in module 0x%p\n", ntHeaders->FileHeader.NumberOfSections, moduleBase);
 
 	// Scan sections
 	for (int i = 0; i < ntHeaders->FileHeader.NumberOfSections; i++) {
@@ -209,18 +197,62 @@ PVOID GetSectionBase(PVOID baseAddress, const char* name) {
 			sections[i].VirtualAddress,
 			sections[i].Misc.VirtualSize);
 
-		if (strncmp(name, (const char*)sections[i].Name, 8) == 0) {
-			PVOID sectionBase = (PBYTE)baseAddress + sections[i].VirtualAddress;
+		if (strncmp(sectionName, (const char*)sections[i].Name, 8) == 0) {
+			info.Base = (PBYTE)moduleBase + sections[i].VirtualAddress;
+			info.Size = sections[i].Misc.VirtualSize;
 			DebugPrint("[+] Found section %s at 0x%p (Size: 0x%X)\n",
-				name,
-				sectionBase,
+				sectionName,
+				info.Base,
 				sections[i].Misc.VirtualSize);
-			return sectionBase;
+			return info;
 		}
 	}
 
-	DebugPrint("[-] Section %s not found\n", name);
-	return nullptr;
+	DebugPrint("[-] Section %s not found\n", sectionName);
+	return info;
+}
+
+/**
+ * @brief Checks if a pointer in target process contains non-NULL value
+ * @param Process Target process PEPROCESS
+ * @param remoteAddress Address to check in target process
+ * @param isBoolean TRUE for BOOLEAN checks, FALSE for PVOID checks
+ * @param pointerName Name of pointer for debug messages
+ * @return TRUE if value exists and is non-zero/NULL
+ */
+BOOLEAN CheckPointerValue(PEPROCESS Process, PVOID remoteAddress, BOOLEAN isBoolean) {
+	if (!remoteAddress) {
+		DebugPrint("[-] Pointer is NULL (skipping check).\n");
+		return FALSE;
+	}
+
+	SIZE_T bytesRead = 0;
+	NTSTATUS status;
+	BOOLEAN result = FALSE;
+
+	if (isBoolean) {
+		BOOLEAN enabled = FALSE;
+		status = MmCopyVirtualMemory(Process, remoteAddress,
+									 PsGetCurrentProcess(), &enabled,
+									 sizeof(BOOLEAN), KernelMode, &bytesRead);
+		if (!NT_SUCCESS(status)) {
+			DebugPrint("[-] Failed to read BOOLEAN (Status: 0x%X, Bytes: %zu)\n", status, bytesRead);
+			return FALSE;
+		}
+		result = enabled;
+	}
+	else {
+		PVOID pointerValue = nullptr;
+		status = MmCopyVirtualMemory(Process, remoteAddress,
+									 PsGetCurrentProcess(), &pointerValue,
+							         sizeof(PVOID), KernelMode, &bytesRead);
+		if (!NT_SUCCESS(status)) {
+			DebugPrint("[-] Failed to read pointer (Status: 0x%X, Bytes: %zu)\n", status, bytesRead);
+			return FALSE;
+		}
+		result = (pointerValue != nullptr);
+	}
+	return result;
 }
 
 
@@ -255,15 +287,14 @@ namespace driver {
 	// EDR pointers
 	static PBYTE gAvrfpEnabled = nullptr;
 	static PBYTE gAvrfpRoutine = nullptr;
-	static PBYTE gShimLoaded = nullptr;
+	static PBYTE gpfnSE_DllLoaded = nullptr;
 
 	// Forward declarations for notifications
 	VOID ScanProcess(PEPROCESS Process);
 	VOID OnProcessNotify(PEPROCESS Process, HANDLE ProcessId, PPS_CREATE_NOTIFY_INFO CreateInfo);
 	VOID OnImageLoadNotify(PUNICODE_STRING FullImageName, HANDLE ProcessId, PIMAGE_INFO ImageInfo);
 	BOOLEAN IsSystemProcess(PEPROCESS Process);
-	VOID ComputeEdrAddresses(PEPROCESS Process);
-	VOID CheckEdrIndicators(PEPROCESS Process);
+	VOID CheckMrdataAddresses(PEPROCESS Process);
 
 	// Log IOC
 	static void LogIoc(_In_ PCSTR msg) {
@@ -524,8 +555,7 @@ VOID driver::OnImageLoadNotify(PUNICODE_STRING FullImageName, HANDLE ProcessId, 
 VOID driver::ScanProcess(PEPROCESS Process) {
 	if (IsSystemProcess(Process))
 		return;
-	ComputeEdrAddresses(Process);
-	CheckEdrIndicators(Process);
+	CheckMrdataAddresses(Process);
 	// TODO: invoke VAD and module scans here
 }
 
@@ -537,30 +567,38 @@ BOOLEAN driver::IsSystemProcess(PEPROCESS Process) {
 	ULONG sid = PsGetProcessSessionId(Process);
 	if (pid < 100 || sid == 0)
 		return TRUE;
-	// Compare process image name against whitelist
+
 	PUNICODE_STRING imgName = nullptr;
 	NTSTATUS status = SeLocateProcessImageName(Process, &imgName);
-	if (NT_SUCCESS(status) && imgName) {
-		for (const wchar_t** wp = SystemProcessWhitelist; *wp; ++wp) {
-			UNICODE_STRING w;
-			RtlInitUnicodeString(&w, *wp);
-			if (RtlEqualUnicodeString(imgName, &w, TRUE)) {
-				DebugPrint("[+] System process occured.\n");
-				ExFreePool(imgName);
-				return TRUE;
-			}
-		}
-		ExFreePool(imgName);
+	if (!NT_SUCCESS(status) || !imgName) {
+		return FALSE;
 	}
-	return FALSE;
+
+	BOOLEAN isWhitelisted = FALSE;
+
+	for (const wchar_t** wp = SystemProcessWhitelist; *wp; ++wp) {
+		// Используем FsRtlIsNameInExpression для поддержки wildcards
+		UNICODE_STRING pattern;
+		RtlInitUnicodeString(&pattern, *wp);
+
+		if (FsRtlIsNameInExpression(&pattern, imgName, TRUE, NULL)) {
+			DebugPrint("[+] Whitelisted process: %wZ (matches pattern: %wZ)\n",
+				imgName, &pattern);
+			isWhitelisted = TRUE;
+			break;
+		}
+	}
+
+	ExFreePool(imgName);
+	return isWhitelisted;
 }
 
 /**
 * @brief Locates EDR-related addresses in ntdll.dll's .mrdata section
 * @param Process Target process PEPROCESS
 */
-VOID driver::ComputeEdrAddresses(PEPROCESS Process) {
-	DebugPrint("[+] ComputeEdrAddresses: Starting ntdll.dll .mrdata scan\n");
+VOID driver::CheckMrdataAddresses(PEPROCESS Process) {
+	DebugPrint("[+] CheckMrdataAddresses: Starting ntdll.dll .mrdata scan\n");
 
 	// 0. Get process name for debug only
 	PUNICODE_STRING processName = nullptr;
@@ -578,7 +616,7 @@ VOID driver::ComputeEdrAddresses(PEPROCESS Process) {
 	PPEB peb = nullptr;
 	NTSTATUS status = GetProcessPeb(Process, &peb);
 	if (!NT_SUCCESS(status)) {
-		DebugPrint("[-] ComputeEdrAddresses: Failed to get PEB.\n");
+		DebugPrint("[-] CheckMrdataAddresses: Failed to get PEB.\n");
 		return;
 	}
 
@@ -586,7 +624,7 @@ VOID driver::ComputeEdrAddresses(PEPROCESS Process) {
 	PVOID ntdllBase = nullptr;
 	status = GetModuleBaseByName(peb, L"ntdll.dll", &ntdllBase);
 	if (!NT_SUCCESS(status)) {
-		DebugPrint("[-] ComputeEdrAddresses: Failed to find ntdll.dll.\n");
+		DebugPrint("[-] CheckMrdataAddresses: Failed to find ntdll.dll.\n");
 		return;
 	}
 
@@ -594,7 +632,7 @@ VOID driver::ComputeEdrAddresses(PEPROCESS Process) {
 	IMAGE_DOS_HEADER dosHeader = { 0 };
 	status = GetDosHeader(Process, ntdllBase, &dosHeader);
 	if (!NT_SUCCESS(status)) {
-		DebugPrint("[-] ComputeEdrAddresses: Invalid ntdll.dll DOS header.\n");
+		DebugPrint("[-] CheckMrdataAddresses: Invalid ntdll.dll DOS header.\n");
 		return;
 	}
 
@@ -602,107 +640,103 @@ VOID driver::ComputeEdrAddresses(PEPROCESS Process) {
 	IMAGE_NT_HEADERS64 ntHeaders = { 0 };
 	status = GetNtHeaders(Process, ntdllBase, &dosHeader, &ntHeaders);
 	if (!NT_SUCCESS(status)) {
-		DebugPrint("[-] ComputeEdrAddresses: Invalid ntdll.dll NT headers.\n");
+		DebugPrint("[-] CheckMrdataAddresses: Invalid ntdll.dll NT headers.\n");
 		return;
 	}
 
 	// 5. Find .mrdata section
-	PVOID mrdataBase = GetSectionBase(ntdllBase, ".mrdata");
-	if (!mrdataBase) {
-		DebugPrint("[-] ComputeEdrAddresses: .mrdata section not found in ntdll.dll\n");
+	SectionInfo mrdata = GetSectionInfo(ntdllBase, ".mrdata");
+	if (!mrdata.Base) {
+		DebugPrint("[-] CheckMrdataAddresses: .mrdata section not found in ntdll.dll\n");
 		return;
 	}
 
-	// 6. Scan for EDR patterns in .mrdata
-	DebugPrint("[+] ComputeEdrAddresses: Scanning .mrdata for EDR indicators...\n");
+	// 6. Scan for EDR preloading and Early Cascade patterns in .mrdata
 
-	//SIZE_T step = sizeof(PVOID);
-	//for (SIZE_T i = 0; i < mrdataSize / step; ++i) {
-	//	PVOID cand = nullptr;
-	//	SIZE_T bytesRead = 0;
-	//	NTSTATUS status1 = MmCopyVirtualMemory(Process, mrdataBase + i * step,
-	//										  PsGetCurrentProcess(), &cand,
-	//										  step, KernelMode, &bytesRead);
-	//	if (!NT_SUCCESS(status1)) break;
-	//	if (cand == mrdataBase) {
-	//		PBYTE pmr = mrdataBase + i * step;
-	//		// Find AvrfpEnabled and AvrfpRoutine
-	//		for (SIZE_T j = 1; j < mrdataSize / step; ++j) {
-	//			PVOID val = nullptr;
-	//			NTSTATUS status2 = MmCopyVirtualMemory(Process, pmr + j * step,
-	//												   PsGetCurrentProcess(), &val,
-	//												   step, KernelMode, &bytesRead);
-	//			if (!NT_SUCCESS(status2)) break;
-	//			if (val == NULL) {
-	//				driver::gAvrfpEnabled = pmr + (j - 1) * step;
-	//				driver::gAvrfpRoutine = pmr + j * step;
-	//				DebugPrint("[+] AvrfpEnabled, AvrfpRoutine finded.\n");
-	//				break;
-	//			}
-	//		}
-	//		// Find ShimLoaded pointer
-	//		for (SIZE_T j = 1; j < mrdataSize / step; ++j) {
-	//			SIZE_T val = 0;
-	//			status = MmCopyVirtualMemory(Process, pmr - j * step,
-	//										 PsGetCurrentProcess(), &val,
-	//										 step, KernelMode, &bytesRead);
-	//			if (val == mrdataSize) {
-	//				driver::gShimLoaded = pmr - (j + 1) * step;
-	//				DebugPrint("[+] ShimLoaded finded.\n");
-	//				break;
-	//			}
-	//		}
-	//		break;
-	//	}
-	//}
+	SIZE_T step = sizeof(PVOID);
 
-	//DebugPrint("[+] ComputeEdrAddresses: completed");
-}
+	// EDR Preloading indicators
 
+	for (SIZE_T i = 0; i < mrdata.Size / step; ++i) {
+		PVOID candidate = nullptr;
+		SIZE_T bytesRead = 0;
 
-/**
- * @brief Check if any EDR hooks or preloader flags are set
- */
-VOID driver::CheckEdrIndicators(PEPROCESS Process) {
-	UNREFERENCED_PARAMETER(Process);
-	DebugPrint("[+] CheckEdrIndicators stub.\n");
+		NTSTATUS status1 = MmCopyVirtualMemory(Process, (PBYTE)mrdata.Base + i * step,
+												  PsGetCurrentProcess(), &candidate,
+												  step, KernelMode, &bytesRead);
 
-	SIZE_T bytesRead = 0;
-	NTSTATUS status;
-	BOOLEAN enabled = FALSE;
-	PVOID routine = nullptr;
-	PVOID shim = nullptr;
+		if (!NT_SUCCESS(status1) || bytesRead != step) {
+			DebugPrint("[-] MmCopyVirtualMemory failed at 0x%p (Status: 0x%X, Bytes: %zu)\n", (PBYTE)mrdata.Base + i * step, status1, bytesRead);
+			continue;
+		}
 
-	// Check AvrfpAPILookupCallbacksEnabled
-	if (driver::gAvrfpEnabled) {
-		status = MmCopyVirtualMemory(Process, driver::gAvrfpEnabled,
-									 PsGetCurrentProcess(), &enabled,
-									 sizeof(enabled), KernelMode, &bytesRead);
-		if (status == STATUS_SUCCESS && enabled) {
-			DebugPrint("[+] CheckEdrIndicators: AvrfpAPILookupCallbacksEnabled is TRUE.\n");
-			LogIoc("[EDR] AvrfpAPILookupCallbacksEnabled true");
+		if (candidate == mrdata.Base) {
+			DebugPrint("[+] Found self-reference at offset 0x%X (Value: 0x%p)\n", i * step, candidate);
+
+			PBYTE pmr = (PBYTE)mrdata.Base + i * step; // self-reference variable on mrdata is perfect indicator
+
+			// AvrfpEnabled/AvrfpRoutine
+			for (SIZE_T j = 1; j < 3; ++j) {
+				PVOID val = nullptr;
+				NTSTATUS status2 = MmCopyVirtualMemory(Process, pmr + j * step, PsGetCurrentProcess(),
+													   &val, step, KernelMode, &bytesRead);
+				if (NT_SUCCESS(status2)) {
+					DebugPrint("    [%zu] Candidate at 0x%p: 0x%p\n", j, pmr + j * step, val);
+
+					if (val == nullptr) {
+						driver::gAvrfpEnabled = pmr + (j - 1) * step;
+						driver::gAvrfpRoutine = pmr + j * step;
+						DebugPrint("[+] Found EDR pointers:\n"
+							"    AvrfpEnabled: 0x%p\n"
+							"    AvrfpRoutine: 0x%p\n",
+							driver::gAvrfpEnabled,
+							driver::gAvrfpRoutine);
+					}
+				}
+			}
 		}
 	}
 
-	// Check AvrfpAPILookupCallbackRoutine
-	if (driver::gAvrfpRoutine) {
-		status = MmCopyVirtualMemory(Process, driver::gAvrfpRoutine,
-									 PsGetCurrentProcess(), &routine,
-									 sizeof(routine), KernelMode, &bytesRead);
-		if (status == STATUS_SUCCESS && routine) {
-			DebugPrint("[+] CheckEdrIndicators: AvrfpAPILookupCallbackRoutine is non-null.\n");
-				LogIoc("[EDR] AvrfpAPILookupCallbackRoutine hooked");
+	// Early Cascade Injection 
+
+	PBYTE searchStart = (PBYTE)driver::gAvrfpEnabled - 0x100; // offset based on heuristics, does not important
+
+	for (int i = 0; i < 100; i++) { // heuristic based index just not to enter endless cycle
+		PBYTE candidate = searchStart - (i * sizeof(PVOID));
+		PVOID value = nullptr;
+		SIZE_T bytesRead = 0;
+
+		NTSTATUS status3 = MmCopyVirtualMemory(Process, candidate,
+											   PsGetCurrentProcess(), &value,
+											   sizeof(PVOID), KernelMode, &bytesRead);
+		if (NT_SUCCESS(status3)) {
+			DebugPrint("[+] Found gpfnSE_DllLoaded candidate @ 0x%p (Value: 0x%p)", candidate, value);
+			// Check if that looks like function offset
+			if ((ULONG_PTR)value > (ULONG_PTR)ntdllBase &&
+				(ULONG_PTR)value < ((ULONG_PTR)ntdllBase + 0x200000)) {
+				driver::gpfnSE_DllLoaded = candidate;
+				DebugPrint("[+] Found gpfnSE_DllLoaded that looks like function @ 0x%p (Value: 0x%p)", candidate, value);
+				break;
+			}
 		}
 	}
 
-	// Check Shim loaded callback
-	if (driver::gShimLoaded) {
-		status = MmCopyVirtualMemory(Process, driver::gShimLoaded,
-									 PsGetCurrentProcess(), &shim,
-									 sizeof(shim), KernelMode, &bytesRead);
-		if (status == STATUS_SUCCESS && shim) {
-			DebugPrint("[+] CheckEdrIndicators: g_pfnSE_DllLoaded is non-null.\n");
-			LogIoc("[EDR] g_pfnSE_DllLoaded hooked");
-		}
+	if (CheckPointerValue(Process, driver::gAvrfpEnabled, TRUE)) {
+		DebugPrint("[+] AvrfpAPILookupCallbacksEnabled is TRUE\n");
+		LogIoc("[EDR] AvrfpAPILookupCallbacksEnabled true");
 	}
+
+	// Проверка AvrfpRoutine (PVOID)
+	if (CheckPointerValue(Process, driver::gAvrfpRoutine, FALSE)) {
+		DebugPrint("[+] AvrfpAPILookupCallbackRoutine is hooked\n");
+		LogIoc("[EDR] AvrfpAPILookupCallbackRoutine hooked");
+	}
+
+	// Проверка gpfnSE_DllLoaded (PVOID)
+	if (CheckPointerValue(Process, driver::gpfnSE_DllLoaded, FALSE)) {
+		DebugPrint("[+] gpfnSE_DllLoaded is hooked\n");
+		LogIoc("[EDR] gpfnSE_DllLoaded hooked");
+	}
+
+	DebugPrint("[+] EDR scan completed for process PID: %d\n", PsGetProcessId(Process));
 }

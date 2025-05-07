@@ -35,30 +35,33 @@ extern UNICODE_STRING gSymLinkName = RTL_CONSTANT_STRING(L"\\DosDevices\\Memscan
 
 // Whitelist of system processes
 static const wchar_t* SystemProcessWhitelist[] = {
-	// System processes
-	L"\\SystemRoot\\System32\\csrss.exe",
-	L"\\SystemRoot\\System32\\wininit.exe",
-	L"\\SystemRoot\\System32\\services.exe",
-	L"\\SystemRoot\\System32\\lsass.exe",
-
 	// Edge processes
-	L"\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe",
-	L"\\Program Files (x86)\\Microsoft\\EdgeWebView\\Application\\*\\msedgewebview2.exe",
+	L"\\??\\*\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe",
+	L"\\??\\*\\Program Files (x86)\\Microsoft\\EdgeWebView\\Application\\*\\msedgewebview2.exe",
 
-	// Windows system processes
-	L"\\Windows\\System32\\backgroundTaskHost.exe",
-	L"\\Windows\\System32\\taskhostw.exe",
-	L"\\Windows\\SystemApps\\Microsoft.Windows.Search_*\\SearchApp.exe",
-	L"\\Windows\\SystemApps\\Microsoft.Windows.SecHealthUI_*\\SecHealthUI.exe",
-	L"\\Windows\\System32\\SecurityHealthHost.exe",
+	// OneDriver processes
+	L"\\??\\*\\Users\\test\\AppData\\Local\\Microsoft\\OneDrive\\*\\OneDriveLauncher.exe",
+
+	// System processes
+	L"\\??\\*\\Windows\\System32\\backgroundTaskHost.exe",
+	L"\\??\\*\\Windows\\System32\\taskhostw.exe",
+	L"\\??\\*\\Windows\\SystemApps\\Microsoft.Windows.Search_*\\SearchApp.exe",
+	L"\\??\\*\\Windows\\SystemApps\\Microsoft.Windows.SecHealthUI_*\\SecHealthUI.exe",
+	L"\\??\\*\\Windows\\System32\\SecurityHealthHost.exe",
+	L"\\??\\*\\Windows\\System32\\RuntimeBroker.exe",
+	L"\\??\\*\\Windows\\System32\\WinSAT.exe",
+	L"\\??\\*\\Windows\\System32\\csrss.exe",
+	L"\\??\\*\\Windows\\System32\\wininit.exe",
+	L"\\??\\*\\Windows\\System32\\services.exe",
+	L"\\??\\*\\Windows\\System32\\lsass.exe",
 
 	// VMware processes
-	L"\\Program Files\\VMware\\VMware Tools\\vmtoolsd.exe",
+	L"\\??\\*\\Program Files\\VMware\\VMware Tools\\vmtoolsd.exe",
 
 	// Frequently encountered processes
-	L"\\Windows\\System32\\svchost.exe",
-	L"\\Windows\\System32\\RuntimeBroker.exe",
-	L"\\Windows\\System32\\dwm.exe",
+	L"\\??\\*\\Windows\\System32\\svchost.exe",
+	L"\\??\\*\\Windows\\System32\\RuntimeBroker.exe",
+	L"\\??\\*\\Windows\\System32\\dwm.exe",
 	nullptr
 };
 
@@ -184,3 +187,10 @@ typedef struct _PEB {
 	PVOID Reserved12[1];
 	ULONG SessionId;
 } PEB, * PPEB;
+
+//////////////////////////// HELPFUL STRUCTURES /////////////////////////
+
+struct SectionInfo {
+	PVOID Base;
+	SIZE_T Size;
+};
