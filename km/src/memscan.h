@@ -33,38 +33,48 @@ extern UNICODE_STRING gDeviceName = RTL_CONSTANT_STRING(L"\\Device\\MemscanDrive
 extern UNICODE_STRING gDriverName = RTL_CONSTANT_STRING(L"\\Driver\\MemscanDriver");
 extern UNICODE_STRING gSymLinkName = RTL_CONSTANT_STRING(L"\\DosDevices\\MemscanDriver");
 
-// Whitelist of system processes
+// Whitelist of system processes. Uppercase is needed
 static const wchar_t* SystemProcessWhitelist[] = {
 	// Edge processes
-	L"\\??\\*\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe",
-	L"\\??\\*\\Program Files (x86)\\Microsoft\\EdgeWebView\\Application\\*\\msedgewebview2.exe",
+	L"*\\PROGRAM FILES (X86)\\MICROSOFT\\EDGE\\APPLICATION\\MSEDGE.EXE",
+	L"*\\PROGRAM FILES (X86)\\MICROSOFT\\EDGEWEBVIEW\\APPLICATION\\*\\MSEDGEWEBVIEW2.EXE",
 
 	// OneDriver processes
-	L"\\??\\*\\Users\\test\\AppData\\Local\\Microsoft\\OneDrive\\*\\OneDriveLauncher.exe",
+	L"*\\USERS\\*\\APPDATA\\LOCAL\\MICROSOFT\\ONEDRIVE\\*\\ONEDRIVELAUNCHER.EXE",
+	L"*\\USERS\\*\\APPDATA\\LOCAL\\MICROSOFT\\ONEDRIVE\\*\\FILECOAUTH.EXE",
+	L"*\\USERS\\*\\APPDATA\\LOCAL\\MICROSOFT\\ONEDRIVE\\ONEDRIVESTANDALONEUPDATER.EXE",
 
 	// System processes
-	L"\\??\\*\\Windows\\System32\\backgroundTaskHost.exe",
-	L"\\??\\*\\Windows\\System32\\taskhostw.exe",
-	L"\\??\\*\\Windows\\SystemApps\\Microsoft.Windows.Search_*\\SearchApp.exe",
-	L"\\??\\*\\Windows\\SystemApps\\Microsoft.Windows.SecHealthUI_*\\SecHealthUI.exe",
-	L"\\??\\*\\Windows\\System32\\SecurityHealthHost.exe",
-	L"\\??\\*\\Windows\\System32\\RuntimeBroker.exe",
-	L"\\??\\*\\Windows\\System32\\WinSAT.exe",
-	L"\\??\\*\\Windows\\System32\\csrss.exe",
-	L"\\??\\*\\Windows\\System32\\wininit.exe",
-	L"\\??\\*\\Windows\\System32\\services.exe",
-	L"\\??\\*\\Windows\\System32\\lsass.exe",
-	L"\\??\\*\\Windows\\System32\\RuntimeBroker.exe",
+	L"*\\WINDOWS\\SYSTEM32\\BACKGROUNDTASKHOST.EXE",
+	L"*\\WINDOWS\\SYSTEM32\\TASKHOSTW.EXE",
+	L"*\\WINDOWS\\SYSTEMAPPS\\*",
+	L"*\\WINDOWS\\SYSTEM32\\SEARCHPROTOCOLHOST.EXE",
+	L"*\\WINDOWS\\EXPLORER.EXE",
+	L"*\\WINDOWS\\SYSTEM32\\SECURITYHEALTHHOST.EXE",
+	L"*\\WINDOWS\\SYSTEM32\\RUNTIMEBROKER.EXE",
+	L"*\\WINDOWS\\SYSTEM32\\WINSAT.EXE",
+	L"*\\WINDOWS\\SYSTEM32\\CSRSS.EXE",
+	L"*\\WINDOWS\\SYSTEM32\\WININIT.EXE",
+	L"*\\WINDOWS\\SYSTEM32\\SERVICES.EXE",
+	L"*\\WINDOWS\\SYSTEM32\\LSASS.EXE",
+	L"*\\WINDOWS\\SYSTEM32\\RUNTIMEBROKER.EXE",
+	L"*\\WINDOWS\\SYSTEM32\\CTFMON.EXE",
+	L"*\\WINDOWS\\SYSTEM32\\DLLHOST.EXE",
+	L"*\\WINDOWS\\SYSTEM32\\SC.EXE",
+	L"*\\WINDOWS\\SYSTEM32\\OOBE\\USEROOBEBROKER.EXE",
+	L"*\\WINDOWS\\IMMERSIVECONTROLPANEL\\SYSTEMSETTINGS.EXE",
+	L"*\\PROGRAM FILES\\WINDOWSAPPS\\*",
 
 	// VMware processes
-	L"\\??\\*\\Program Files\\VMware\\VMware Tools\\vmtoolsd.exe",
+	L"*\\PROGRAM FILES\\VMWARE\\VMWARE TOOLS\\VMTOOLSD.EXE",
 
 	// Frequently encountered processes
-	L"\\??\\*\\Windows\\System32\\svchost.exe",
-	L"\\??\\*\\Windows\\System32\\RuntimeBroker.exe",
-	L"\\??\\*\\Windows\\System32\\dwm.exe",
+	L"*\\WINDOWS\\SYSTEM32\\SVCHOST.EXE",
+	L"*\\WINDOWS\\SYSTEM32\\RUNTIMEBROKER.EXE",
+	L"*\\WINDOWS\\SYSTEM32\\DWM.EXE",
 	nullptr
 };
+
 
 //////////////////////////////// PRIVATE MICROSOFT STRUCTURES //////////////////////////////
 
@@ -194,10 +204,4 @@ typedef struct _PEB {
 struct SectionInfo {
 	PVOID Base;
 	SIZE_T Size;
-};
-
-struct EdrIndicators {
-	PVOID AvrfpEnabled;
-	PVOID AvrfpRoutine;
-	PVOID gpfnSE_DllLoaded;
 };

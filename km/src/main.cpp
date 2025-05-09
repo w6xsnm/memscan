@@ -29,7 +29,7 @@ NTSTATUS GetProcessPeb(PEPROCESS Process, PPEB* peb) {
 		return STATUS_INVALID_PARAMETER;
 	}
 
-	*peb = PsGetProcessPeb(Process);
+	*peb = PsGetProcessPeb(Process); // or with ZwQueryInformationProcess??
 	if (!*peb) {
 		DebugPrint("[-] GetProcessPeb: Failed to get PEB.\n");
 		return STATUS_NOT_FOUND;
@@ -255,6 +255,39 @@ BOOLEAN CheckPointerValue(PEPROCESS Process, PVOID remoteAddress, BOOLEAN isBool
 	return result;
 }
 
+/**
+ * @brief Safe version of MmCopyVirtualMemory, which copy to kernel target address
+ * @param Process Source process
+ * @param Address Source address
+ * @param Buffer  Target address
+ * @param Size    Number of bytes to copy
+ * @return 
+ */
+NTSTATUS SafeCopy(PEPROCESS Process, PVOID Address, PVOID Buffer, SIZE_T Size) {
+	if (!Process || !Address || !Buffer || !Size) {
+		return STATUS_INVALID_PARAMETER;
+	}
+	if (PsGetProcessExitStatus(Process) != STATUS_PENDING) {
+		return STATUS_PROCESS_IS_TERMINATING;
+	}
+	__try {
+		SIZE_T bytes = 0;
+		NTSTATUS status = MmCopyVirtualMemory(
+			Process, Address,
+			PsGetCurrentProcess(), Buffer,
+			Size, KernelMode, &bytes
+		);
+
+		if (NT_SUCCESS(status) && bytes != Size) {
+			return STATUS_PARTIAL_COPY;
+		}
+		return status;
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER) {
+		return GetExceptionCode();
+	}
+}
+
 
 /////////////////////////////// DRIVER ////////////////////////////////////////////
 
@@ -291,7 +324,7 @@ namespace driver {
 
 	// Forward declarations for notifications
 	VOID ScanProcess(PEPROCESS Process);
-	VOID OnProcessNotify(PEPROCESS Process, HANDLE ProcessId, PPS_CREATE_NOTIFY_INFO CreateInfo);
+	//VOID OnProcessNotify(PEPROCESS Process, HANDLE ProcessId, PPS_CREATE_NOTIFY_INFO CreateInfo);
 	VOID OnImageLoadNotify(PUNICODE_STRING FullImageName, HANDLE ProcessId, PIMAGE_INFO ImageInfo);
 	BOOLEAN IsSystemProcess(PEPROCESS Process);
 	VOID CheckMrdataAddresses(PEPROCESS Process);
@@ -437,11 +470,11 @@ VOID DriverUnload(PDRIVER_OBJECT DriverObject) {
 
 	DebugPrint("[+] Unloading driver, unregistering callbacks...\n");
 
-	NTSTATUS status = PsSetCreateProcessNotifyRoutineEx(driver::OnProcessNotify, TRUE);
+	/*NTSTATUS status = PsSetCreateProcessNotifyRoutineEx(driver::OnProcessNotify, TRUE);
 	if (!NT_SUCCESS(status)) {
 		DebugPrint("[-] Failed to unregister process notify.\n");
 	}
-	DebugPrint("[+] Process notify unregistered.\n");
+	DebugPrint("[+] Process notify unregistered.\n");*/
 
 	status = PsRemoveLoadImageNotifyRoutine((PLOAD_IMAGE_NOTIFY_ROUTINE)driver::OnImageLoadNotify);
 	if (!NT_SUCCESS(status)) {
@@ -476,14 +509,14 @@ NTSTATUS DriverMain(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) {
 									 FILE_DEVICE_SECURE_OPEN, FALSE, &gDeviceObject);
 
 	if (!NT_SUCCESS(status)) {
-		DebugPrint("[-] Failed to create driver device.\n");
+		DebugPrint("[-] Failed to create driver device: 0x%X\n", status);
 	}
 	DebugPrint("[+] Driver device successfully created.\n");
 
 	// Establish symbolic link
 	status = IoCreateSymbolicLink(&gSymLinkName, (PUNICODE_STRING)&gDeviceName);
 	if (!NT_SUCCESS(status)) {
-		DebugPrint("[-] Failed to establish symbolic link.\n");
+		DebugPrint("[-] Failed to establish symbolic link: 0x%X\n", status);
 	}
 	DebugPrint("[+] Symbolic link was established successfully.\n");
 
@@ -497,8 +530,14 @@ NTSTATUS DriverMain(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) {
 	DriverObject->DriverUnload = DriverUnload;
 
 	// Register notifications
-	PsSetCreateProcessNotifyRoutineEx((PCREATE_PROCESS_NOTIFY_ROUTINE_EX)driver::OnProcessNotify, FALSE);
-	PsSetLoadImageNotifyRoutine((PLOAD_IMAGE_NOTIFY_ROUTINE)driver::OnImageLoadNotify);
+	/*status = PsSetCreateProcessNotifyRoutineEx((PCREATE_PROCESS_NOTIFY_ROUTINE_EX)driver::OnProcessNotify, FALSE);
+	if (!NT_SUCCESS(status)) {
+		DebugPrint("[-] Failed to set create process notify routine: 0x%X\n", status);
+	}*/
+	status = PsSetLoadImageNotifyRoutine((PLOAD_IMAGE_NOTIFY_ROUTINE)driver::OnImageLoadNotify);
+	if (!NT_SUCCESS(status)) {
+		DebugPrint("[-] Failed to set load image notify routine: 0x%X\n", status);
+	}
 
 	// End of initialization
 	ClearFlag(gDeviceObject->Flags, DO_DEVICE_INITIALIZING);
@@ -517,35 +556,51 @@ NTSTATUS DriverEntry() {
 
 	NTSTATUS status = IoCreateDriver(&gDriverName, &DriverMain);
 	if (!NT_SUCCESS(status)) {
-		DebugPrint("[-] Failed to create a driver.\n");
+		DebugPrint("[-] Failed to create a driver: 0x%X\n", status);
 		return status;
 	}
-	DebugPrint("[+] Driver has created successfully.\n");
+	DebugPrint("[+] Driver was created successfully.\n");
 	return status;
 
 }
 
 ///////////////////////// SCANNING ////////////////////////////////
 
-/**
- * @brief Called on process creation or termination
- */
-VOID driver::OnProcessNotify(PEPROCESS Process, HANDLE ProcessId, PPS_CREATE_NOTIFY_INFO CreateInfo) {
-	UNREFERENCED_PARAMETER(ProcessId);
-	UNREFERENCED_PARAMETER(CreateInfo);
-	ScanProcess(Process);
-}
+///**
+// * @brief Called on process creation or termination
+// */
+//VOID driver::OnProcessNotify(PEPROCESS Process, HANDLE ProcessId, PPS_CREATE_NOTIFY_INFO CreateInfo) {
+//	UNREFERENCED_PARAMETER(ProcessId);
+//	
+//	if (CreateInfo) {
+//		DebugPrint("[<] Run scanning on process create notify.\n");
+//		ScanProcess(Process); // call scan process only on creation (TERMINATION to mb?)
+//	}
+//}
 
 /**
  * @brief Called on image load into process
  */
 VOID driver::OnImageLoadNotify(PUNICODE_STRING FullImageName, HANDLE ProcessId, PIMAGE_INFO ImageInfo) {
-	UNREFERENCED_PARAMETER(FullImageName);
 	UNREFERENCED_PARAMETER(ImageInfo);
-	PEPROCESS proc = nullptr;
-	if (NT_SUCCESS(PsLookupProcessByProcessId(ProcessId, &proc))) {
-		ScanProcess(proc);
-		ObDereferenceObject(proc);
+
+	if (!FullImageName || !FullImageName->Buffer) {
+		DebugPrint("[-] Empty image name, can not start scanning.\n");
+		return;
+	}
+
+	UNICODE_STRING kernel32;
+	RtlInitUnicodeString(&kernel32, L"*\\KERNEL32.DLL");
+
+	// We want to scan only processes with ntdll image loaded
+	// Since this is the most important image for rootkits, proccess should be analyzed immediately 
+	if (FsRtlIsNameInExpression(&kernel32, FullImageName, TRUE, NULL)) {
+		PEPROCESS proc = nullptr;
+		if (NT_SUCCESS(PsLookupProcessByProcessId(ProcessId, &proc))) {
+			DebugPrint("[<] Start scanning on image load notify.\n");
+			ScanProcess(proc);
+			ObDereferenceObject(proc);
+		}
 	}
 }
 
@@ -555,6 +610,17 @@ VOID driver::OnImageLoadNotify(PUNICODE_STRING FullImageName, HANDLE ProcessId, 
 VOID driver::ScanProcess(PEPROCESS Process) {
 	if (IsSystemProcess(Process))
 		return;
+
+	// debug
+	PUNICODE_STRING processName = nullptr;
+	if (NT_SUCCESS(SeLocateProcessImageName(Process, &processName)) && processName) {
+		DebugPrint("[<] Scanning process: %wZ\n", processName);
+		ExFreePool(processName);
+	}
+	else {
+		DebugPrint("[<] Scanning process (PID: %d)\n", PsGetProcessId(Process));
+	}
+
 	CheckMrdataAddresses(Process);
 	// TODO: invoke VAD and module scans here
 }
@@ -575,14 +641,13 @@ BOOLEAN driver::IsSystemProcess(PEPROCESS Process) {
 
 	BOOLEAN isWhitelisted = FALSE;
 
+	DebugPrint("[<] Whitelist check Process: %wZ\n", imgName);
+
 	for (const wchar_t** wp = SystemProcessWhitelist; *wp; ++wp) {
-		// Используем FsRtlIsNameInExpression для поддержки wildcards
 		UNICODE_STRING pattern;
 		RtlInitUnicodeString(&pattern, *wp);
-
 		if (FsRtlIsNameInExpression(&pattern, imgName, TRUE, NULL)) {
-			DebugPrint("[+] Whitelisted process: %wZ (matches pattern: %wZ)\n",
-				imgName, &pattern);
+			DebugPrint("[+] Whitelisted process: %wZ (matches pattern: %wZ)\n", imgName, &pattern);
 			isWhitelisted = TRUE;
 			break;
 		}
@@ -599,55 +664,46 @@ BOOLEAN driver::IsSystemProcess(PEPROCESS Process) {
 VOID driver::CheckMrdataAddresses(PEPROCESS Process) {
 	DebugPrint("[+] CheckMrdataAddresses: Starting ntdll.dll .mrdata scan\n");
 
-	// 0. Get process name for debug only
-	PUNICODE_STRING processName = nullptr;
-	if (NT_SUCCESS(SeLocateProcessImageName(Process, &processName)) && processName) {
-		DebugPrint("[+] Scanning process: %wZ\n", processName);
-		ExFreePool(processName);
-	}
-	else {
-		DebugPrint("[+] Scanning process (PID: %d)\n", PsGetProcessId(Process));
-	}
-
-
 	// 1. Get process PEB
 	PPEB peb = nullptr;
-	if (!NT_SUCCESS(GetProcessPeb(Process, &peb))) {
-		DebugPrint("[-] CheckMrdataAddresses: Failed to get PEB.\n");
+	NTSTATUS status = GetProcessPeb(Process, &peb);
+	if (!NT_SUCCESS(status)) {
+		DebugPrint("[-] CheckMrdataAddresses: Failed to get PEB: 0x%X\n", status);
 		return;
 	}
 
 	// 2. Get ntdll.dll base address
 	PVOID ntdllBase = nullptr;
-	if (!NT_SUCCESS(GetModuleBaseByName(peb, L"ntdll.dll", &ntdllBase))) {
-		DebugPrint("[-] CheckMrdataAddresses: Failed to find ntdll.dll.\n");
+	status = GetModuleBaseByName(peb, L"ntdll.dll", &ntdllBase);
+	if (!NT_SUCCESS(status)) {
+		DebugPrint("[-] CheckMrdataAddresses: Failed to find ntdll.dll: 0x%X\n", status);
 		return;
 	}
 
 	// 3. Get DOS header
 	IMAGE_DOS_HEADER dosHeader = { 0 };
-	if (!NT_SUCCESS(GetDosHeader(Process, ntdllBase, &dosHeader))) {
-		DebugPrint("[-] CheckMrdataAddresses: Invalid ntdll.dll DOS header.\n");
+	status = GetDosHeader(Process, ntdllBase, &dosHeader);
+	if (!NT_SUCCESS(status)) {
+		DebugPrint("[-] CheckMrdataAddresses: Invalid ntdll.dll DOS header: 0x%X\n", status);
 		return;
 	}
 
 	// 4. Get NT headers
 	IMAGE_NT_HEADERS64 ntHeaders = { 0 };
-	if (!NT_SUCCESS(GetNtHeaders(Process, ntdllBase, &dosHeader, &ntHeaders))) {
-		DebugPrint("[-] CheckMrdataAddresses: Invalid ntdll.dll NT headers.\n");
+	status = GetNtHeaders(Process, ntdllBase, &dosHeader, &ntHeaders);
+	if (!NT_SUCCESS(status)) {
+		DebugPrint("[-] CheckMrdataAddresses: Invalid ntdll.dll NT headers: 0x%X\n", status);
 		return;
 	}
 
 	// 5. Find .mrdata section
 	SectionInfo mrdata = GetSectionInfo(ntdllBase, ".mrdata");
-	if (!mrdata.Base) {
-		DebugPrint("[-] CheckMrdataAddresses: .mrdata section not found in ntdll.dll\n");
+	if (!mrdata.Base || !mrdata.Size) {
+		DebugPrint("[-] CheckMrdataAddresses: .mrdata section not found in ntdll.dll.\n");
 		return;
 	}
 
 	// 6. Scan for EDR preloading and Early Cascade patterns in .mrdata
-
-	EdrIndicators indicators = {};
 
 	// EDR Preloading indicators
 
@@ -655,12 +711,12 @@ VOID driver::CheckMrdataAddresses(PEPROCESS Process) {
 	PBYTE pmr = NULL;
 	for (SIZE_T offset = 0; offset < mrdata.Size; offset += sizeof(PVOID)) {
 		PVOID value = NULL;
-		if (NT_SUCCESS(MmCopyVirtualMemory(Process, (PBYTE)mrdata.Base + offset,
-			PsGetCurrentProcess(), &value,
-			sizeof(PVOID), KernelMode, NULL))) {
+		PBYTE remoteAddr = (PBYTE)mrdata.Base + offset;
+		if (NT_SUCCESS(SafeCopy(Process, remoteAddr, &value,
+			sizeof(PVOID)))) {
 			if (value == mrdata.Base) { // anchor is always equal to mrdata base
-				pmr = (PBYTE)mrdata.Base + offset;
-				DebugPrint("[+] Anchor found @ 0x%p (offset +0x%zX)\n", pmr, offset);
+				pmr = remoteAddr;
+				DebugPrint("[+] Anchor found at 0x%p (offset +0x%zX)\n", pmr, offset);
 				break;
 			}
 		}
@@ -677,15 +733,11 @@ VOID driver::CheckMrdataAddresses(PEPROCESS Process) {
 		PBYTE candidate = pmr + (i * sizeof(PVOID));
 		PVOID enabled = NULL;
 		PVOID routine = NULL;
-
-		if (!NT_SUCCESS(MmCopyVirtualMemory(Process, candidate, PsGetCurrentProcess(), &enabled,
-			sizeof(PVOID), KernelMode, NULL))) {
+		if (!NT_SUCCESS(SafeCopy(Process, candidate, &enabled, sizeof(PVOID)))) {
 			continue;
 		}
 
-		if (!NT_SUCCESS(MmCopyVirtualMemory(Process, candidate + sizeof(PVOID),
-			PsGetCurrentProcess(), &routine,
-			sizeof(PVOID), KernelMode, NULL))) {
+		if (!NT_SUCCESS(SafeCopy(Process, candidate+sizeof(PVOID), &routine, sizeof(PVOID)))) {
 			continue;
 		}
 
@@ -703,22 +755,18 @@ VOID driver::CheckMrdataAddresses(PEPROCESS Process) {
 
 		// Clean process
 		if ((enabled == NULL || (UINT_PTR)enabled <= 1) && routine == NULL) {
-			indicators.AvrfpEnabled = candidate;
-			indicators.AvrfpRoutine = candidate + sizeof(PVOID);
 			DebugPrint("[+] Clean Avrfp pointers found (+%d steps):\n"
 				"    Enabled @ 0x%p (0x%p)\n"
 				"    Routine @ 0x%p (0x%p)\n",
 				i, candidate, enabled, candidate + sizeof(PVOID), routine);
 			break;
-		}
+		} // can be deleted later
 		else if ((UINT_PTR)enabled == 1 && routine != NULL) { // malware process
-			indicators.AvrfpEnabled = candidate;
-			indicators.AvrfpRoutine = candidate + sizeof(PVOID);
-			// TODO: IOCs
 			DebugPrint("[+] Hooked Avrfp pointers found (+%d steps):\n"
 				"    Enabled @ 0x%p (0x%p)\n"
 				"    Routine @ 0x%p (0x%p)\n",
 				i, candidate, enabled, candidate + sizeof(PVOID), routine);
+			LogIoc("[EDR] EDR Preloading");
 			break;
 		}
 	}
@@ -733,33 +781,13 @@ VOID driver::CheckMrdataAddresses(PEPROCESS Process) {
 		PBYTE candidate = pmr + possibleOffsets[i];
 		PVOID value = NULL;
 
-		if (NT_SUCCESS(MmCopyVirtualMemory(Process, candidate,
-			PsGetCurrentProcess(), &value,
-			sizeof(PVOID), KernelMode, NULL))) {
-			// TODO: IOCs
-			indicators.gpfnSE_DllLoaded = candidate;
-			DebugPrint("[+] Found gpfnSE_DllLoaded candidate @ 0x%p (value: 0x%p)\n",
-				candidate, value);
-				break;
+		if (NT_SUCCESS(SafeCopy(Process, candidate, &value, sizeof(PVOID))) && 
+			value != NULL) {
+			LogIoc("[EDR] Early Cascade Injection");
+			DebugPrint("[+] Found gpfnSE_DllLoaded hooked @ 0x%p (value: 0x%p)\n", candidate, value);
+			break; 
 		}
 	}
-
-	if (CheckPointerValue(Process, driver::gAvrfpEnabled, TRUE)) {
-		DebugPrint("[+] AvrfpAPILookupCallbacksEnabled is TRUE\n");
-		LogIoc("[EDR] AvrfpAPILookupCallbacksEnabled true");
-	}
-
-	//// Проверка AvrfpRoutine (PVOID)
-	//if (CheckPointerValue(Process, driver::gAvrfpRoutine, FALSE)) {
-	//	DebugPrint("[+] AvrfpAPILookupCallbackRoutine is hooked\n");
-	//	LogIoc("[EDR] AvrfpAPILookupCallbackRoutine hooked");
-	//}
-
-	//// Проверка gpfnSE_DllLoaded (PVOID)
-	//if (CheckPointerValue(Process, driver::gpfnSE_DllLoaded, FALSE)) {
-	//	DebugPrint("[+] gpfnSE_DllLoaded is hooked\n");
-	//	LogIoc("[EDR] gpfnSE_DllLoaded hooked");
-	//}
 
 	DebugPrint("[+] EDR scan completed for process PID: %d\n", PsGetProcessId(Process));
 }
