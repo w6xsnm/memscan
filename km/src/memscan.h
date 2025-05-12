@@ -3,6 +3,7 @@
 #include <ntimage.h>
 #include <minwindef.h>
 #include <stdarg.h>
+#include <ntstrsafe.h>
 
 //undocumented windows internal functions (exported by ntoskrnl)
 extern "C" {
@@ -14,7 +15,14 @@ extern "C" {
 		PSIZE_T ReturnSize);
 	NTKERNELAPI ULONG PsGetProcessSessionId(PEPROCESS Process);
 	NTKERNELAPI PPEB PsGetProcessPeb(PEPROCESS Process);
+	NTKERNELAPI NTSTATUS ZwQuerySystemInformation(ULONG SystemInformationClass,
+												  PVOID SystemInformation,
+												  ULONG SystemInformationLenght,
+											      PULONG ReturnLength);
 }
+
+#define PROCESS_QUERY_INFORMATION	0x1000
+#define PROCESS_VM_READ				0x0010
 
 // IOC (Indicators of Compromise) buffer constants
 #define IOC_MAX_ENTRIES    512
@@ -64,6 +72,7 @@ static const wchar_t* SystemProcessWhitelist[] = {
 	L"*\\WINDOWS\\SYSTEM32\\OOBE\\USEROOBEBROKER.EXE",
 	L"*\\WINDOWS\\IMMERSIVECONTROLPANEL\\SYSTEMSETTINGS.EXE",
 	L"*\\PROGRAM FILES\\WINDOWSAPPS\\*",
+	L"*\\WINDOWS\\SYSTEM32\\WerFault.exe",
 
 	// VMware processes
 	L"*\\PROGRAM FILES\\VMWARE\\VMWARE TOOLS\\VMTOOLSD.EXE",
@@ -82,6 +91,14 @@ typedef struct _ACTIVATION_CONTEXT _ACTIVATION_CONTEXT, * P_ACTIVATION_CONTEXT;
 typedef struct _ACTIVATION_CONTEXT_DATA _ACTIVATION_CONTEXT_DATA, * P_ACTIVATION_CONTEXT_DATA;
 typedef struct _ASSEMBLY_STORAGE_MAP _ASSEMBLY_STORAGE_MAP, * P_ASSEMBLY_STORAGE_MAP;
 typedef struct _FLS_CALLBACK_INFO _FLS_CALLBACK_INFO, * P_FLS_CALLBACK_INFO;
+
+typedef struct _FILE_STANDARD_INFO {
+	LARGE_INTEGER AllocationSize;
+	LARGE_INTEGER EndOfFile;
+	DWORD         NumberOfLinks;
+	BOOLEAN       DeletePending;
+	BOOLEAN       Directory;
+} FILE_STANDARD_INFO, * PFILE_STANDARD_INFO;
 
 typedef struct _RTL_DRIVE_LETTER_CURDIR
 {
@@ -205,3 +222,31 @@ struct SectionInfo {
 	PVOID Base;
 	SIZE_T Size;
 };
+
+typedef struct _MODULE_ENTRY {
+	PVOID BaseAddress;
+	UNICODE_STRING FullDllName;
+	UNICODE_STRING BaseDllName;
+	ULONG SizeOfImage;
+	ULONG TimeDateStamp;
+	ULONG CheckSum;
+	PVOID EntryPoint;
+} MODULE_ENTRY, * PMODULE_ENTRY;
+
+typedef struct _MEMORY_REGION {
+	PVOID BaseAddress;
+	SIZE_T RegionSize;
+	ULONG Protection;
+	ULONG Type;
+	ULONG State;
+} MEMORY_REGION, * PMEMORY_REGION;
+
+#define MAX_MODULES 256
+#define MAX_MEMORY_REGIONS 1024
+#define PAGE_EXECUTABLE (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)
+
+typedef NTSTATUS(NTAPI* PFN_NT_OPEN_SECTION)(
+	PHANDLE SectionHandle,
+	ACCESS_MASK DesiredAccess,
+	POBJECT_ATTRIBUTES ObjectAttributes
+	);

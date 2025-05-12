@@ -288,6 +288,78 @@ NTSTATUS SafeCopy(PEPROCESS Process, PVOID Address, PVOID Buffer, SIZE_T Size) {
 	}
 }
 
+/**
+ * @brief Safely queries virtual memory information from a target process.
+ * @param Process Pointer to the target process (PEPROCESS).
+ * @param BaseAddress Virtual address in the target process to query.
+ * @param pmbi Pointer to a MEMORY_BASIC_INFORMATION struct to receive the info.
+ * @return NTSTATUS status code.
+ */
+NTSTATUS SafeQuery(PEPROCESS Process, PVOID BaseAddress, PMEMORY_BASIC_INFORMATION pmbi)
+{
+	NTSTATUS status = STATUS_UNSUCCESSFUL;
+	HANDLE hProcess = NULL;
+	SIZE_T returnedLen = 0;
+
+	status = ObOpenObjectByPointer(Process,
+		OBJ_KERNEL_HANDLE,
+		NULL,
+		PROCESS_QUERY_INFORMATION | PROCESS_VM_READ,
+		*PsProcessType,
+		KernelMode,
+		&hProcess);
+	if (!NT_SUCCESS(status)) {
+		DebugPrint("[-] SafeQuery: ObOpenObjectByPointer failed: 0x%X\n", status);
+		return status;
+	}
+
+	__try {
+		if (!MmIsAddressValid(BaseAddress)) {
+			DebugPrint("[-] SafeQuery: Invalid BaseAddress: %p\n", BaseAddress);
+			status = STATUS_ACCESS_VIOLATION;
+			__leave;
+		}
+
+		RtlZeroMemory(pmbi, sizeof(MEMORY_BASIC_INFORMATION));
+
+		status = ZwQueryVirtualMemory(hProcess,
+			BaseAddress,
+			MemoryBasicInformation,
+			pmbi,
+			sizeof(MEMORY_BASIC_INFORMATION),
+			&returnedLen);
+
+		if (!NT_SUCCESS(status)) {
+			DebugPrint("[-] SafeQuery: ZwQueryVirtualMemory failed: 0x%X\n", status);
+			__leave;
+		}
+
+		DebugPrint("[+] SafeQuery: Base=%p State=0x%X Type=0x%X Protect=0x%X\n",
+			pmbi->BaseAddress, pmbi->State, pmbi->Type, pmbi->Protect);
+	}
+	__finally {
+		if (hProcess)
+			ZwClose(hProcess);
+	}
+
+	return status;
+}
+
+/**
+ * @brief Compute SHA1 hash
+ * @param Data
+ * @param Size
+ * @param Hash
+ * @return
+ */
+VOID Sha1Hash(PVOID Data, SIZE_T Size, PBYTE Hash) {
+	UNREFERENCED_PARAMETER(Data);
+	UNREFERENCED_PARAMETER(Size);
+	UNREFERENCED_PARAMETER(Hash);
+
+	DebugPrint("[<] Hash function called.\n");
+}
+
 
 /////////////////////////////// DRIVER ////////////////////////////////////////////
 
@@ -327,7 +399,13 @@ namespace driver {
 	//VOID OnProcessNotify(PEPROCESS Process, HANDLE ProcessId, PPS_CREATE_NOTIFY_INFO CreateInfo);
 	VOID OnImageLoadNotify(PUNICODE_STRING FullImageName, HANDLE ProcessId, PIMAGE_INFO ImageInfo);
 	BOOLEAN IsSystemProcess(PEPROCESS Process);
-	VOID CheckMrdataAddresses(PEPROCESS Process);
+	NTSTATUS CheckMrdataAddresses(PEPROCESS Process);
+	NTSTATUS CheckDuplicateModules(PEPROCESS Process);
+	NTSTATUS VerifyTextSections(PEPROCESS Process);
+	NTSTATUS CheckSystemModulesMemory(PEPROCESS Process);
+	NTSTATUS CheckPebIntegrity(PEPROCESS Process);
+	NTSTATUS CheckRemoteThreads(PEPROCESS Process);
+	BOOLEAN IsDotNetProcess(PEPROCESS Process);
 
 	// Log IOC
 	static void LogIoc(_In_ PCSTR msg) {
@@ -476,7 +554,7 @@ VOID DriverUnload(PDRIVER_OBJECT DriverObject) {
 	}
 	DebugPrint("[+] Process notify unregistered.\n");*/
 
-	status = PsRemoveLoadImageNotifyRoutine((PLOAD_IMAGE_NOTIFY_ROUTINE)driver::OnImageLoadNotify);
+	NTSTATUS status = PsRemoveLoadImageNotifyRoutine((PLOAD_IMAGE_NOTIFY_ROUTINE)driver::OnImageLoadNotify);
 	if (!NT_SUCCESS(status)) {
 		DebugPrint("[-] Failed to unregister load image notify.\n");
 	}
@@ -611,18 +689,29 @@ VOID driver::ScanProcess(PEPROCESS Process) {
 	if (IsSystemProcess(Process))
 		return;
 
-	// debug
+	// Debug info
 	PUNICODE_STRING processName = nullptr;
 	if (NT_SUCCESS(SeLocateProcessImageName(Process, &processName)) && processName) {
 		DebugPrint("[<] Scanning process: %wZ\n", processName);
 		ExFreePool(processName);
 	}
-	else {
-		DebugPrint("[<] Scanning process (PID: %d)\n", PsGetProcessId(Process));
+
+	// Always perform these checks regardless of .NET status
+	CheckMrdataAddresses(Process);
+
+	// Skip additional checks for .NET processes
+	if (IsDotNetProcess(Process)) {
+		DebugPrint("[+] Skipping additional checks for .NET process.\n");
+		return;
 	}
 
-	CheckMrdataAddresses(Process);
-	// TODO: invoke VAD and module scans here
+	// Execute all other checks
+	CheckDuplicateModules(Process);
+	VerifyTextSections(Process);
+	CheckSystemModulesMemory(Process);
+	CheckPebIntegrity(Process);
+
+	DebugPrint("[+] Process scan completed for PID: %d\n", PsGetProcessId(Process));
 }
 
 /**
@@ -661,7 +750,7 @@ BOOLEAN driver::IsSystemProcess(PEPROCESS Process) {
 * @brief Locates EDR-related addresses in ntdll.dll's .mrdata section
 * @param Process Target process PEPROCESS
 */
-VOID driver::CheckMrdataAddresses(PEPROCESS Process) {
+NTSTATUS driver::CheckMrdataAddresses(PEPROCESS Process) {
 	DebugPrint("[+] CheckMrdataAddresses: Starting ntdll.dll .mrdata scan\n");
 
 	// 1. Get process PEB
@@ -669,7 +758,7 @@ VOID driver::CheckMrdataAddresses(PEPROCESS Process) {
 	NTSTATUS status = GetProcessPeb(Process, &peb);
 	if (!NT_SUCCESS(status)) {
 		DebugPrint("[-] CheckMrdataAddresses: Failed to get PEB: 0x%X\n", status);
-		return;
+		return status;
 	}
 
 	// 2. Get ntdll.dll base address
@@ -677,7 +766,7 @@ VOID driver::CheckMrdataAddresses(PEPROCESS Process) {
 	status = GetModuleBaseByName(peb, L"ntdll.dll", &ntdllBase);
 	if (!NT_SUCCESS(status)) {
 		DebugPrint("[-] CheckMrdataAddresses: Failed to find ntdll.dll: 0x%X\n", status);
-		return;
+		return status;
 	}
 
 	// 3. Get DOS header
@@ -685,7 +774,7 @@ VOID driver::CheckMrdataAddresses(PEPROCESS Process) {
 	status = GetDosHeader(Process, ntdllBase, &dosHeader);
 	if (!NT_SUCCESS(status)) {
 		DebugPrint("[-] CheckMrdataAddresses: Invalid ntdll.dll DOS header: 0x%X\n", status);
-		return;
+		return status;
 	}
 
 	// 4. Get NT headers
@@ -693,14 +782,14 @@ VOID driver::CheckMrdataAddresses(PEPROCESS Process) {
 	status = GetNtHeaders(Process, ntdllBase, &dosHeader, &ntHeaders);
 	if (!NT_SUCCESS(status)) {
 		DebugPrint("[-] CheckMrdataAddresses: Invalid ntdll.dll NT headers: 0x%X\n", status);
-		return;
+		return status;
 	}
 
 	// 5. Find .mrdata section
 	SectionInfo mrdata = GetSectionInfo(ntdllBase, ".mrdata");
 	if (!mrdata.Base || !mrdata.Size) {
 		DebugPrint("[-] CheckMrdataAddresses: .mrdata section not found in ntdll.dll.\n");
-		return;
+		return STATUS_UNSUCCESSFUL;
 	}
 
 	// 6. Scan for EDR preloading and Early Cascade patterns in .mrdata
@@ -724,7 +813,7 @@ VOID driver::CheckMrdataAddresses(PEPROCESS Process) {
 
 	if (!pmr) {
 		DebugPrint("[-] Anchor not found in .mrdata.\n");
-		return;
+		return STATUS_UNSUCCESSFUL;
 	}
 
 	// 6.2. Finding AvrfpEnabled/AvrfpRoutine
@@ -769,6 +858,7 @@ VOID driver::CheckMrdataAddresses(PEPROCESS Process) {
 			LogIoc("[EDR] EDR Preloading");
 			break;
 		}
+		return STATUS_SUCCESS;
 	}
 
 	// 6.3. Finding gpfnSE_DllLoaded
@@ -790,4 +880,459 @@ VOID driver::CheckMrdataAddresses(PEPROCESS Process) {
 	}
 
 	DebugPrint("[+] EDR scan completed for process PID: %d\n", PsGetProcessId(Process));
+
+	return STATUS_SUCCESS;
+}
+
+/**
+ * @brief Checks for duplicate modules in process
+ * @param Process Target process
+ */
+NTSTATUS driver::CheckDuplicateModules(PEPROCESS Process) {
+	PPEB peb = nullptr;
+	NTSTATUS status = GetProcessPeb(Process, &peb);
+	if (!NT_SUCCESS(status)) {
+		DebugPrint("[-] CheckDuplicateModules: Failed to get PEB: 0x%X\n", status);
+		return status;
+	}
+
+	PLIST_ENTRY listHead = &peb->Ldr->InMemoryOrderModuleList;
+	PLIST_ENTRY listEntry = listHead->Flink;
+	MODULE_ENTRY modules[MAX_MODULES];
+	ULONG moduleCount = 0;
+
+	while (listEntry != listHead && moduleCount < MAX_MODULES) {
+		PLDR_DATA_TABLE_ENTRY entry = CONTAINING_RECORD(listEntry, LDR_DATA_TABLE_ENTRY, InMemoryOrderLinks);
+
+		modules[moduleCount].BaseAddress = entry->DllBase;
+		modules[moduleCount].FullDllName = entry->FullDllName;
+		modules[moduleCount].BaseDllName = entry->BaseDllName;
+		modules[moduleCount].SizeOfImage = entry->SizeOfImage;
+
+		// Get additional module info from PE headers
+		IMAGE_DOS_HEADER dosHeader = { 0 };
+		IMAGE_NT_HEADERS64 ntHeaders = { 0 };
+
+		status = GetDosHeader(Process, entry->DllBase, &dosHeader);
+		if (NT_SUCCESS(status)) {
+			status = GetNtHeaders(Process, entry->DllBase, &dosHeader, &ntHeaders);
+			if (NT_SUCCESS(status)) {
+				modules[moduleCount].TimeDateStamp = ntHeaders.FileHeader.TimeDateStamp;
+				modules[moduleCount].CheckSum = ntHeaders.OptionalHeader.CheckSum;
+				modules[moduleCount].EntryPoint = (PVOID)((ULONG_PTR)entry->DllBase + ntHeaders.OptionalHeader.AddressOfEntryPoint);
+			}
+		}
+
+		moduleCount++;
+		listEntry = listEntry->Flink;
+	}
+
+	// Check for duplicates
+	for (ULONG i = 0; i < moduleCount; i++) {
+		for (ULONG j = i + 1; j < moduleCount; j++) {
+			// Compare by name and characteristics
+			if (RtlEqualUnicodeString(&modules[i].BaseDllName, &modules[j].BaseDllName, TRUE) ||
+				(modules[i].TimeDateStamp == modules[j].TimeDateStamp &&
+					modules[i].CheckSum == modules[j].CheckSum)) {
+				DebugPrint("[-] Duplicate module detected: %wZ\n", &modules[i].BaseDllName);
+				driver::LogIoc("[DLL] DLL Hollowing detected");
+				return STATUS_SUCCESS;
+			}
+		}
+	}
+
+	DebugPrint("[+] All modules in process are unique.\n");
+
+	return STATUS_SUCCESS;
+}
+
+/**
+ * @brief Verifies .text sections integrity
+ * @param Process Target process
+ */
+NTSTATUS driver::VerifyTextSections(PEPROCESS Process)
+{
+	PPEB peb = nullptr;
+	NTSTATUS status = GetProcessPeb(Process, &peb);
+	if (!NT_SUCCESS(status)) {
+		DebugPrint("[-] VerifyTextSections: Failed to get PEB: 0x%X\n", status);
+		return status;
+	}
+
+	if (!peb->Ldr) {
+		DebugPrint("[-] PEB->Ldr is NULL\n");
+		return STATUS_INVALID_ADDRESS;
+	}
+
+	PLIST_ENTRY listHead = &peb->Ldr->InMemoryOrderModuleList;
+	PLIST_ENTRY listEntry = listHead->Flink;
+	BYTE diskHash[20] = { 0 };
+	BYTE memoryHash[20] = { 0 };
+
+	while (listEntry != listHead) {
+		PLDR_DATA_TABLE_ENTRY entry = CONTAINING_RECORD(listEntry, LDR_DATA_TABLE_ENTRY, InMemoryOrderLinks);
+
+		// 1. Get .text section info
+
+		SectionInfo textSection = GetSectionInfo(entry->DllBase, ".text");
+
+		if (textSection.Base && textSection.Size) {
+
+			// 2. Check memory type
+
+			MEMORY_BASIC_INFORMATION mbi = { 0 };
+			status = SafeQuery(Process, textSection.Base, &mbi);
+
+			if (!NT_SUCCESS(status)) {
+				DebugPrint("[-] VerifyTextSections: Failed to query memory info for %wZ: 0x%X\n",
+					&entry->BaseDllName, status);
+				listEntry = listEntry->Flink;
+				continue;
+			}
+
+			if (mbi.Type != SEC_IMAGE) {
+				DebugPrint("[-] Invalid .text section type in %wZ: 0x%X\n",
+					&entry->BaseDllName, mbi.Type);
+				driver::LogIoc("[TEXT] Shellcode - .text patch detected");
+				listEntry = listEntry->Flink;
+				continue;
+			}
+			DebugPrint("[+] .text section is IMAGE section.\n");
+
+			// 3. Calculate memory hash
+
+			PVOID buffer = ExAllocatePool2(POOL_FLAG_NON_PAGED, textSection.Size, 'TXTH');
+			if (!buffer) {
+				DebugPrint("[-] VerifyTextSections: Failed to allocate memory for %wZ\n", &entry->BaseDllName);
+				listEntry = listEntry->Flink;
+				continue;
+			}
+
+			SIZE_T bytesRead = 0;
+			status = SafeCopy(Process, textSection.Base, buffer,textSection.Size);
+
+			if (NT_SUCCESS(status) && bytesRead == textSection.Size) {
+				Sha1Hash(buffer, textSection.Size, memoryHash);
+			}
+			ExFreePoolWithTag(buffer, 'TXTH');
+
+			// 4. Get disk file path
+			HANDLE hFile = NULL;
+			OBJECT_ATTRIBUTES oa;
+			UNICODE_STRING filePath;
+			RtlInitUnicodeString(&filePath, entry->FullDllName.Buffer);
+			InitializeObjectAttributes(&oa, &filePath, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, NULL);
+
+			IO_STATUS_BLOCK ioStatus;
+			status = ZwOpenFile(&hFile, FILE_READ_DATA | SYNCHRONIZE,
+								(POBJECT_ATTRIBUTES)&oa, &ioStatus, FILE_SHARE_READ,
+								FILE_SYNCHRONOUS_IO_NONALERT);
+
+			if (NT_SUCCESS(status)) {
+
+				// 5. Map file and find .text section
+
+				FILE_STANDARD_INFO fileInfo;
+				status = ZwQueryInformationFile(hFile, &ioStatus, &fileInfo, 
+												sizeof(fileInfo), FileStandardInformation);
+
+				if (NT_SUCCESS(status)) {
+					PVOID fileMapping = NULL;
+					SIZE_T viewSize = 0;
+					status = ZwMapViewOfSection(hFile, NtCurrentProcess(), &fileMapping,
+												0, 0, NULL, &viewSize, ViewShare, 0,
+												PAGE_READONLY);
+
+					if (NT_SUCCESS(status)) {
+
+						// 6. Find .text section in file
+
+						IMAGE_DOS_HEADER* dosHeader = (IMAGE_DOS_HEADER*)fileMapping;
+						if (dosHeader->e_magic == IMAGE_DOS_SIGNATURE) {
+							IMAGE_NT_HEADERS* ntHeaders = (IMAGE_NT_HEADERS*)((PBYTE)fileMapping + dosHeader->e_lfanew);
+							if (ntHeaders->Signature == IMAGE_NT_SIGNATURE) {
+								IMAGE_SECTION_HEADER* section = IMAGE_FIRST_SECTION(ntHeaders);
+								for (WORD i = 0; i < ntHeaders->FileHeader.NumberOfSections; i++) {
+									if (strncmp((char*)section[i].Name, ".text", 5) == 0) {
+										PVOID textSectionFile = (PBYTE)fileMapping + section[i].PointerToRawData;
+										Sha1Hash(textSectionFile, section[i].SizeOfRawData, diskHash);
+										break;
+									}
+								}
+							}
+						}
+						ZwUnmapViewOfSection(NtCurrentProcess(), fileMapping);
+					}
+				}
+				ZwClose(hFile);
+			}
+
+			DebugPrint("[<] Hashes comparasing...\n");
+			// 7. Compare hashes
+			if (RtlCompareMemory(diskHash, memoryHash, 20) != 20) {
+				DebugPrint("[-] .text section modified in %wZ\n", &entry->BaseDllName);
+				driver::LogIoc("[TEXT] Code modification detected");
+
+				// Log hashes for debugging
+				/*DebugPrint("[+] Disk hash:    %02x%02x...%02x%02x\n",
+					diskHash[0], diskHash[1], diskHash[20 - 2], diskHash[20 - 1]);
+				DebugPrint("[+] Memory hash: %02x%02x...%02x%02x\n",
+					memoryHash[0], memoryHash[1], memoryHash[SHA1_DIGEST_SIZE - 2], memoryHash[SHA1_DIGEST_SIZE - 1]);*/
+			}
+			else {
+				DebugPrint("[+] Hashes of .text from memory and from disk are equal.\n");
+			}
+		}
+
+		listEntry = listEntry->Flink;
+	}
+
+	DebugPrint("[+] End of .text sections analysis in modules.\n");
+
+	return STATUS_SUCCESS;
+}
+
+/**
+ * @brief Checks critical system modules memory protection
+ * @param Process Target process
+ */
+NTSTATUS driver::CheckSystemModulesMemory(PEPROCESS Process) {
+	const wchar_t* criticalModules[] = { L"ntdll.dll", L"kernel32.dll", L"com.dll", NULL };
+	ULONG regionCount = 0;
+	PVOID baseAddress = 0;
+
+	MEMORY_REGION* regions = (MEMORY_REGION*)ExAllocatePool2(
+		POOL_FLAG_PAGED,
+		sizeof(MEMORY_REGION) * MAX_MEMORY_REGIONS,
+		'DRVR');
+	if (!regions) return STATUS_INSUFFICIENT_RESOURCES;
+
+	// Enumerate all memory regions
+	while (regionCount < MAX_MEMORY_REGIONS) {
+		MEMORY_BASIC_INFORMATION mbi = { 0 };
+		NTSTATUS status = SafeQuery(Process, baseAddress, &mbi);
+
+		if (!NT_SUCCESS(status)) break;
+
+		regions[regionCount].BaseAddress = mbi.BaseAddress;
+		regions[regionCount].RegionSize = mbi.RegionSize;
+		regions[regionCount].Protection = mbi.Protect;
+		regions[regionCount].Type = mbi.Type;
+		regions[regionCount].State = mbi.State;
+		regionCount++;
+
+		baseAddress = (PBYTE)mbi.BaseAddress + mbi.RegionSize;
+	}
+
+	// Check critical modules
+
+	PPEB peb = nullptr;
+	NTSTATUS status = GetProcessPeb(Process, &peb);
+	if (!NT_SUCCESS(status)) {
+		DebugPrint("[-] CheckSystemModulesMemory: Failed to get PEB: 0x%X\n", status);
+		ExFreePool(regions);
+		return status;
+	}
+
+	for (const wchar_t** modName = criticalModules; *modName; modName++) {
+		PVOID modBase = nullptr;
+		status = GetModuleBaseByName(peb, *modName, &modBase);
+		if (!NT_SUCCESS(status)) continue;
+
+		// Find regions belonging to this module
+		for (ULONG i = 0; i < regionCount; i++) {
+			
+			// Check for private/shared executable memory
+			
+			if ((regions[i].Type == MEM_PRIVATE || regions[i].Type == MEM_MAPPED) &&
+				(regions[i].Protection & PAGE_EXECUTABLE)) {
+				DebugPrint("[-] Suspicious memory in %ws: 0x%p (Type: %d, Protect: 0x%X)\n",
+					*modName, regions[i].BaseAddress, regions[i].Type, regions[i].Protection);
+				driver::LogIoc("[MEM] Shellcode - abnormal executable pages");
+			}
+
+			// Check for non-shared critical modules
+			if (regions[i].Type != SEC_IMAGE && regions[i].State == MEM_COMMIT) {
+				DebugPrint("[-] Non-MEM_IMAGE region in %ws: 0x%p (Type: %d)\n",
+					*modName, regions[i].BaseAddress, regions[i].Type);
+				driver::LogIoc("[MEM] DLL Hollowing detected");
+			}
+		}
+	}
+
+	ExFreePool(regions);
+
+	return STATUS_SUCCESS;
+}
+
+/**
+ * @brief Checks PEB integrity
+ * @param Process Target process
+ */
+NTSTATUS driver::CheckPebIntegrity(PEPROCESS Process) {
+	PPEB peb = nullptr;
+	NTSTATUS status = GetProcessPeb(Process, &peb);
+	if (!NT_SUCCESS(status)) {
+		DebugPrint("[-] CheckPebIntegrity: Failed to get PEB: 0x%X\n", status);
+		return status;
+	}
+
+	// Check ImageBaseAddress (stored in Reserved3[0])
+	PVOID imageBase = peb->Reserved3[0];
+	if (!imageBase) {
+		DebugPrint("[-] Empty ImageBaseAddress in PEB\n");
+		driver::LogIoc("[PEB] Process Hollowing detected");
+		return STATUS_SUCCESS;
+	}
+
+	MEMORY_BASIC_INFORMATION mbi = { 0 };
+	status = ZwQueryVirtualMemory(Process, imageBase, MemoryBasicInformation,
+								  &mbi, sizeof(mbi), NULL);
+
+	if (!NT_SUCCESS(status)) {
+		DebugPrint("[-] CheckPebIntegrity: Failed to query memory info: 0x%X\n", status);
+		return status;
+	}
+
+	if (mbi.Type != SEC_IMAGE) {
+		DebugPrint("[-] Invalid ImageBaseAddress type: %d\n", mbi.Type);
+		driver::LogIoc("[PEB] Process Hollowing detected");
+	}
+
+	// Check process paths
+
+	PUNICODE_STRING imagePath = nullptr;
+	status = SeLocateProcessImageName(Process, &imagePath);
+	if (!NT_SUCCESS(status) || !imagePath || !imagePath->Buffer) {
+		DebugPrint("[-] Empty or invalid process image path\n");
+		driver::LogIoc("[PEB] Process Doppelganging detected");
+	}
+	else {
+
+		// Compare PEB path with kernel path
+
+		if (!peb->ProcessParameters ||
+			!peb->ProcessParameters->ImagePathName.Buffer ||
+			!RtlEqualUnicodeString(&peb->ProcessParameters->ImagePathName, imagePath, TRUE)) {
+			DebugPrint("[-] PEB and kernel process paths differ\n");
+			driver::LogIoc("[PEB] Process Doppelganging detected");
+		}
+		ExFreePool(imagePath);
+	}
+
+	return STATUS_SUCCESS;
+}
+
+///**
+// * @brief Checks for remote threads
+// * @param Process Target process
+// */
+//NTSTATUS driver::CheckRemoteThreads(PEPROCESS Process) {
+//	HANDLE processId = PsGetProcessId(Process);
+//	THREAD_INFO threads[MAX_THREADS] = { 0 };
+//	ULONG threadCount = EnumProcessThreads(processId, threads, MAX_THREADS);
+//
+//	for (ULONG i = 0; i < threadCount; i++) {
+//		// Check if thread belongs to this process
+//		if (threads[i].ProcessId != processId) {
+//			DebugPrint("[-] Remote thread detected (TID: %d, Start: 0x%p)\n",
+//				threads[i].ThreadId, threads[i].StartAddress);
+//			driver::LogIoc("[THRD] Remote thread injection detected");
+//			continue;
+//		}
+//
+//		// Check thread start address
+//		MEMORY_BASIC_INFORMATION mbi = { 0 };
+//		NTSTATUS status = ZwQueryVirtualMemory(Process, threads[i].StartAddress, MemoryBasicInformation,
+//											   &mbi, sizeof(mbi), NULL);
+//
+//		if (NT_SUCCESS(status)) {
+//			if (mbi.Type != MEM_IMAGE) {
+//				DebugPrint("[-] Suspicious thread start address: 0x%p (Type: %d)\n",
+//					threads[i].StartAddress, mbi.Type);
+//				driver::LogIoc("[THRD] Shellcode execution detected");
+//			}
+//		}
+//	}
+//
+//	return STATUS_SUCCESS;
+//}
+
+/**
+* @brief Checks if process is a .NET process
+* @param Process Target process
+* @return TRUE if process is .NET process
+*/
+BOOLEAN driver::IsDotNetProcess(PEPROCESS Process) {
+
+	// 1. Get process handle
+
+	HANDLE hProcess = NULL;
+	NTSTATUS status = ObOpenObjectByPointer(
+		Process,
+		OBJ_KERNEL_HANDLE,
+		NULL,
+		0x1000, // PROCESS_QUERY_INFORMATION
+		*PsProcessType,
+		KernelMode,
+		&hProcess
+	);
+
+	if (!NT_SUCCESS(status)) {
+		DbgPrint("[-] IsDotNetProcess: Failed to open process handle: 0x%X\n", status);
+		return FALSE;
+	}
+
+	// 2. Get process ID
+
+	HANDLE pid = PsGetProcessId(Process);
+
+	// 3. Prepare section name
+
+	WCHAR sectionName[128];
+	ANSI_STRING format;
+	UNICODE_STRING usSectionName;
+
+	RtlInitAnsiString(&format, "\\BaseNamedObjects\\Cor_Private_IPCBlock_v4_%d");
+	RtlAnsiStringToUnicodeString(&usSectionName, &format, TRUE);
+
+	// Simple but safe string construction
+
+	RtlZeroMemory(sectionName, sizeof(sectionName));
+	RtlCopyMemory(sectionName, usSectionName.Buffer, usSectionName.Length);
+	RtlFreeUnicodeString(&usSectionName);
+
+	// Manually append PID (safe for kernel-mode)
+
+	ULONG pidValue = HandleToULong(pid);
+	RtlStringCchPrintfW(sectionName, ARRAYSIZE(sectionName), L"\\BaseNamedObjects\\Cor_Private_IPCBlock_v4_%d", pidValue);
+
+	// 4. Initialize object attributes
+
+	RtlInitUnicodeString(&usSectionName, sectionName);
+
+	OBJECT_ATTRIBUTES oa;
+	InitializeObjectAttributes(
+		&oa,
+		&usSectionName,
+		OBJ_KERNEL_HANDLE | OBJ_CASE_INSENSITIVE,
+		NULL,
+		NULL
+	);
+
+	// 5. Open section
+
+	HANDLE hSection = NULL;
+	status = ZwOpenSection(&hSection, SECTION_QUERY, (POBJECT_ATTRIBUTES)&oa);
+
+	// 6. Check result
+	if (NT_SUCCESS(status)) {
+		DbgPrint("[+] .NET process detected (PID: %d)\n", pidValue);
+		ZwClose(hSection);
+		ZwClose(hProcess);
+		return TRUE;
+	}
+
+	ZwClose(hProcess);
+	return FALSE;
 }
