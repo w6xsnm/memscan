@@ -396,7 +396,7 @@ namespace driver {
 
 	// Forward declarations for notifications
 	VOID ScanProcess(PEPROCESS Process);
-	//VOID OnProcessNotify(PEPROCESS Process, HANDLE ProcessId, PPS_CREATE_NOTIFY_INFO CreateInfo);
+	VOID OnProcessNotify(PEPROCESS Process, HANDLE ProcessId, PPS_CREATE_NOTIFY_INFO CreateInfo);
 	VOID OnImageLoadNotify(PUNICODE_STRING FullImageName, HANDLE ProcessId, PIMAGE_INFO ImageInfo);
 	BOOLEAN IsSystemProcess(PEPROCESS Process);
 	NTSTATUS CheckMrdataAddresses(PEPROCESS Process);
@@ -548,21 +548,21 @@ VOID DriverUnload(PDRIVER_OBJECT DriverObject) {
 
 	DebugPrint("[+] Unloading driver, unregistering callbacks...\n");
 
-	/*NTSTATUS status = PsSetCreateProcessNotifyRoutineEx(driver::OnProcessNotify, TRUE);
+	NTSTATUS status = PsSetCreateProcessNotifyRoutineEx(driver::OnProcessNotify, TRUE);
 	if (!NT_SUCCESS(status)) {
-		DebugPrint("[-] Failed to unregister process notify.\n");
+		DebugPrint("[-] Failed to unregister process notify: 0x%X\n", status);
 	}
-	DebugPrint("[+] Process notify unregistered.\n");*/
+	DebugPrint("[+] Process notify unregistered.\n");
 
-	NTSTATUS status = PsRemoveLoadImageNotifyRoutine((PLOAD_IMAGE_NOTIFY_ROUTINE)driver::OnImageLoadNotify);
+	status = PsRemoveLoadImageNotifyRoutine((PLOAD_IMAGE_NOTIFY_ROUTINE)driver::OnImageLoadNotify);
 	if (!NT_SUCCESS(status)) {
-		DebugPrint("[-] Failed to unregister load image notify.\n");
+		DebugPrint("[-] Failed to unregister load image notify: 0x%X\n", status);
 	}
 	DebugPrint("[+] Load image notify unregistered.\n");
 
 	status = IoDeleteSymbolicLink(&gSymLinkName);
 	if (!NT_SUCCESS(status)) {
-		DebugPrint("[-] Failed to delete symbolic link.\n");
+		DebugPrint("[-] Failed to delete symbolic link: 0x%X\n", status);
 	}
 	DebugPrint("[+] Symbolic link deleted.\n");
 
@@ -608,10 +608,10 @@ NTSTATUS DriverMain(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) {
 	DriverObject->DriverUnload = DriverUnload;
 
 	// Register notifications
-	/*status = PsSetCreateProcessNotifyRoutineEx((PCREATE_PROCESS_NOTIFY_ROUTINE_EX)driver::OnProcessNotify, FALSE);
+	status = PsSetCreateProcessNotifyRoutineEx((PCREATE_PROCESS_NOTIFY_ROUTINE_EX)driver::OnProcessNotify, FALSE);
 	if (!NT_SUCCESS(status)) {
 		DebugPrint("[-] Failed to set create process notify routine: 0x%X\n", status);
-	}*/
+	}
 	status = PsSetLoadImageNotifyRoutine((PLOAD_IMAGE_NOTIFY_ROUTINE)driver::OnImageLoadNotify);
 	if (!NT_SUCCESS(status)) {
 		DebugPrint("[-] Failed to set load image notify routine: 0x%X\n", status);
@@ -644,17 +644,17 @@ NTSTATUS DriverEntry() {
 
 ///////////////////////// SCANNING ////////////////////////////////
 
-///**
-// * @brief Called on process creation or termination
-// */
-//VOID driver::OnProcessNotify(PEPROCESS Process, HANDLE ProcessId, PPS_CREATE_NOTIFY_INFO CreateInfo) {
-//	UNREFERENCED_PARAMETER(ProcessId);
-//	
-//	if (CreateInfo) {
-//		DebugPrint("[<] Run scanning on process create notify.\n");
-//		ScanProcess(Process); // call scan process only on creation (TERMINATION to mb?)
-//	}
-//}
+/**
+ * @brief Called on process creation or termination
+ */
+VOID driver::OnProcessNotify(PEPROCESS Process, HANDLE ProcessId, PPS_CREATE_NOTIFY_INFO CreateInfo) {
+	UNREFERENCED_PARAMETER(ProcessId);
+	
+	if (CreateInfo) {
+		DebugPrint("[<] Run scanning on process create notify.\n");
+		ScanProcess(Process); // call scan process only on creation (TERMINATION to mb?)
+	}
+}
 
 /**
  * @brief Called on image load into process
@@ -670,13 +670,13 @@ VOID driver::OnImageLoadNotify(PUNICODE_STRING FullImageName, HANDLE ProcessId, 
 	UNICODE_STRING kernel32;
 	RtlInitUnicodeString(&kernel32, L"*\\KERNEL32.DLL");
 
-	// We want to scan only processes with ntdll image loaded
+	// We want to scan only processes with ntdll image loaded (loaded before kernel32.dll)
 	// Since this is the most important image for rootkits, proccess should be analyzed immediately 
 	if (FsRtlIsNameInExpression(&kernel32, FullImageName, TRUE, NULL)) {
 		PEPROCESS proc = nullptr;
 		if (NT_SUCCESS(PsLookupProcessByProcessId(ProcessId, &proc))) {
 			DebugPrint("[<] Start scanning on image load notify.\n");
-			ScanProcess(proc);
+			CheckMrdataAddresses(proc);
 			ObDereferenceObject(proc);
 		}
 	}
@@ -697,7 +697,7 @@ VOID driver::ScanProcess(PEPROCESS Process) {
 	}
 
 	// Always perform these checks regardless of .NET status
-	CheckMrdataAddresses(Process);
+	// CheckMrdataAddresses(Process);
 
 	// Skip additional checks for .NET processes
 	if (IsDotNetProcess(Process)) {
